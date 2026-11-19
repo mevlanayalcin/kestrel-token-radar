@@ -98,6 +98,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.kpis.watchlist} watchlist, ${radar.kpis.emerging} emerging, ${radar.kpis.comps} tokenized comps fitted, ${radar.kpis.aside_above + radar.kpis.excluded_below} screened out)\n` +
-    `token radar: LOO R2 ${radar.fit.loo.metrics.r2} rho ${radar.fit.loo.metrics.rho} med|log err| ${radar.fit.loo.metrics.med_abs_log_err}; walk-forward pooled rho ${radar.fit.wf.pooled.rho}; verdicts FARM ${radar.kpis.farm} / THIN ${radar.kpis.thin} / SKIP ${radar.kpis.skip}\n` +
+    `token radar: LOO R2 ${radar.fit.loo.metrics.r2} rho ${radar.fit.loo.metrics.rho} med|log err| ${radar.fit.loo.metrics.med_abs_log_err}; nested LOO R2 ${radar.fit.nested.metrics.r2}; walk-forward pooled rho ${radar.fit.wf.pooled.rho}; verdicts FARM ${radar.kpis.farm} / THIN ${radar.kpis.thin} / SKIP ${radar.kpis.skip}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dash.length} files, ${dashBytes} bytes), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

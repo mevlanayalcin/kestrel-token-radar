@@ -153,7 +153,7 @@ for (const d of data.rows) {
   const netPct = (dep) => rnd((100 * rnd((dep * gross) / 100 - rnd(gas + MD.bridge_usd + rnd(dep * MD.opportunity_cost_annum * (hold / 365), 2), 2), 2)) / dep, 2);
   const p1 = netPct(MD.deposit_usd[0]);
   const verdict = p1 >= MD.farm_net_pct ? 'FARM' : p1 >= MD.thin_net_pct ? 'THIN' : 'SKIP';
-  if (p1 !== b.net_ev_pct_1000 || netPct(MD.deposit_usd[1]) !== b.net_ev_pct_5000 || hold !== b.farm.hold_days || gas !== b.farm.gas_usd) evMismatch++;
+  if (p1 !== b.net_ev_pct_1000 || netPct(MD.deposit_usd[1]) !== b.net_ev_pct_5000 || netPct(MD.deposit_usd[2]) !== b.net_ev_pct_25000 || hold !== b.farm.hold_days || gas !== b.farm.gas_usd) evMismatch++;
   if (verdict !== b.verdict) verdictMismatch++;
 }
 ok('cross: data.js farm steps rebuild board.json steps 100%', stepMismatch === 0, `${stepMismatch} mismatches`);
@@ -167,7 +167,10 @@ ok('cross: board rows all record no token', data.rows.every((d) => !data.live.so
 ok('cross: every row names traded anchor comps', data.rows.every((d) => d.anchor_comps.length >= 2 && d.anchor_comps.every((a) => data.live.some((l) => l.slug === a.slug && l.mcap_usd === a.mcap_usd))));
 ok('cross: dollar bands bracket the mid for every row', data.rows.every((d) => d.implied_low_usd <= d.implied_value_usd && d.implied_value_usd <= d.implied_high_usd));
 ok('cross: fit validates 87 comps LOO and 3 walk-forward folds', F.loo.metrics.n === 87 && F.n_comps === 87 && F.wf.folds.length === 3 && F.wf.pooled.n === 50);
-ok('cross: regression beats the hand-set baselines on LOO R2', F.loo.metrics.r2 > F.baselines[0].metrics.r2 && F.loo.metrics.r2 > 0, `model ${F.loo.metrics.r2} vs shrink-median ${F.baselines[0].metrics.r2}`);
+const shrink = F.baselines.find((b) => b.name.startsWith('shrink-median'));
+ok('cross: regression beats the hand-set baselines on LOO R2', F.loo.metrics.r2 > shrink.metrics.r2 && F.loo.metrics.r2 > 0, `model ${F.loo.metrics.r2} vs shrink-median ${shrink.metrics.r2}`);
+ok('cross: nested LOO reported over all 87 comps', F.nested.metrics.n === 87 && F.nested.same_lam >= 0 && F.nested.same_lam <= 87, `nested R2 ${F.nested.metrics.r2}, same triple in ${F.nested.same_lam} folds`);
+ok('cross: dashboard source under the 64,000-byte budget', totalBytes < 64000, `${totalBytes} bytes`);
 const fnl = data.kpis;
 ok('cross: the 758-protocol funnel adds up exactly', fnl.comps + fnl.tokenized_no_mcap + fnl.tokenized_small_mcap + fnl.watchlist_ranked + fnl.aside_above + fnl.excluded_below + fnl.emerging === fnl.total, `${fnl.total} classified`);
 ok('cross: every set-aside carries an exact reason', data.aside.every((a) => a.reason.length > 20 && a.name.length > 0 && slugs.has(a.slug)) && data.aside.length === fnl.aside_above + fnl.excluded_below);

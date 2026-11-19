@@ -1,4 +1,4 @@
-// Kestrel Token Radar: the fitted valuation model and the board builder (kestrel-3).
+// Kestrel Token Radar: the fitted valuation model and the board builder (kestrel-4).
 //
 // One sealed snapshot in, one ranked board out.
 //
@@ -20,7 +20,9 @@
 //                via centering; group penalties: lambda_size on log(tvl), lambda_noise on momentum/
 //                age/breadth, lambda_category on the dummies. The triple is chosen from a shipped
 //                grid by maximum leave-one-out R² (the selection is disclosed on the page).
-// - validation   (1) Leave-One-Out: refit 87 times, each comp blind to itself.
+// - validation   (1) Leave-One-Out: refit 87 times, each comp blind to itself; then a strict nested
+//                    LOO that re-selects the penalties inside every one of the 87 folds, so the
+//                    reported skill also pays for the grid search (no selection leakage).
 //                (2) Temporal walk-forward: dated comps split into four equal cohorts by listed_at;
 //                    three expanding folds train on OLDER comps and predict the NEWER cohort blind;
 //                    each fold re-selects its lambdas by LOO on its training cohort alone (nested,
@@ -28,7 +30,8 @@
 //                    in a test fold. Both passes report R², Spearman rho, median absolute log
 //                    error and the within-2x share. The shrink-median multiple model (the
 //                    hand-calibrated baseline) is scored under the identical LOO pass and shown
-//                    beside the regression, so the page argues instead of asserting.
+//                    beside the regression with a TVL-only log-log OLS, so the page argues instead
+//                    of asserting.
 // - implied      a board row's implied FDV is exp(the fitted log mcap) of its own features; the
 //                dollar band is implied x exp(Q25..Q75 of the LOO log residuals).
 //
@@ -117,7 +120,7 @@ export const MODEL: ModelConstants = {
   drop_band_lo: 0.005,
   drop_band_hi: 0.02,
   capture_factor: 3,
-  deposit_usd: [1000, 5000],
+  deposit_usd: [1000, 5000, 25000],
   farm_net_pct: 5,
   thin_net_pct: 1,
   gas_default_usd: 0.5,
@@ -135,7 +138,7 @@ export const GAS_USD: Record<string, number> = {
 };
 
 /** The model's version label: the dashboard names it, the board carries it. */
-export const MODEL_VERSION = 'kestrel-3';
+export const MODEL_VERSION = 'kestrel-4';
 
 // ---------------------------------------------------------------- basics
 
@@ -322,6 +325,7 @@ export interface ModelFit {
   feature_names: string[];
   elasticity_at_mean: number;
   in_sample_r2: number;
+  nested: { metrics: ValMetrics; same_lam: number };
   loo: { metrics: ValMetrics; resid_q10: number; resid_q25: number; resid_q75: number; resid_q90: number };
   wf: { folds: WfFold[]; pooled: ValMetrics; cohorts: number };
   loo_points: LooPoint[];
@@ -345,8 +349,10 @@ export interface FarmEconomics {
   bridge_usd: number;
   op1k_usd: number;
   op5k_usd: number;
+  op25k_usd: number;
   cost1k_usd: number;
   cost5k_usd: number;
+  cost25k_usd: number;
   gross_lo_pct: number;
   gross_mid_pct: number;
   gross_hi_pct: number;
@@ -356,8 +362,10 @@ export interface FarmEconomics {
   alloc5k_hi_usd: number;
   net1k_usd: number;
   net5k_usd: number;
+  net25k_usd: number;
   net1k_pct: number;
   net5k_pct: number;
+  net25k_pct: number;
   verdict: 'FARM' | 'THIN' | 'SKIP';
 }
 
@@ -382,6 +390,7 @@ export interface BoardRow {
   verdict: 'FARM' | 'THIN' | 'SKIP';
   net_ev_pct_1000: number;
   net_ev_pct_5000: number;
+  net_ev_pct_25000: number;
   anchor_comps: { slug: string; name: string; category: string; tvl_usd: number; mcap_usd: number; multiple: number }[];
   farm: FarmEconomics;
   farm_steps: string[];
@@ -406,6 +415,7 @@ export interface RadarRow {
   verdict: 'FARM' | 'THIN' | 'SKIP';
   net_ev_pct_1000: number;
   net_ev_pct_5000: number;
+  net_ev_pct_25000: number;
   anchor_comps: BoardRow['anchor_comps'];
   farm: FarmEconomics;
   x: number[];
@@ -535,7 +545,8 @@ function holdDaysFor(age: number | null, model: ModelConstants): number {
  * expectation is the drop band (0.5%-2% of the implied FDV, pro-rata over current TVL) scaled by
  * the fitted multiple and the capture factor for activity-weighted drops; costs are per-chain gas
  * for TX_COUNT transactions, one bridge allowance and the capital's opportunity cost over the hold
- * window. The verdict thresholds apply to the $1,000 mid-band net return.
+ * window. The verdict thresholds apply to the $1,000 mid-band net return; $5,000 and $25,000 are
+ * the sensitivity tiers (fixed costs amortize, carry does not).
  */
 export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string[], age: number | null, model: ModelConstants = MODEL): FarmEconomics {
   const farmed = [...chains].sort().slice(0, 2);
@@ -543,17 +554,20 @@ export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string
   const bridge = model.bridge_usd;
   const hold = holdDaysFor(age, model);
   const mult = impliedUsd / tvlUsd;
-  const [d1, d5] = model.deposit_usd;
+  const [d1, d5, d25] = model.deposit_usd as [number, number, number];
   const gm = (model.drop_band_lo + model.drop_band_hi) / 2;
   const op = (d: number) => round(d * model.opportunity_cost_annum * (hold / 365), 2);
   const grossPct = round(100 * gm * mult * model.capture_factor, 2);
   const op1 = op(d1);
   const op5 = op(d5);
+  const op25 = op(d25);
   const c1 = round(gas + bridge + op1, 2);
   const c5 = round(gas + bridge + op5, 2);
+  const c25 = round(gas + bridge + op25, 2);
   const net = (d: number, cc: number) => round((d * grossPct) / 100 - cc, 2);
   const n1 = net(d1, c1);
   const n5 = net(d5, c5);
+  const n25 = net(d25, c25);
   const netPct1 = round((100 * n1) / d1, 2);
   const band = (d: number, f: number) => round(d * f * mult * model.capture_factor, 2);
   return {
@@ -563,8 +577,10 @@ export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string
     bridge_usd: bridge,
     op1k_usd: op1,
     op5k_usd: op5,
+    op25k_usd: op25,
     cost1k_usd: c1,
     cost5k_usd: c5,
+    cost25k_usd: c25,
     gross_lo_pct: round(100 * model.drop_band_lo * mult * model.capture_factor, 2),
     gross_mid_pct: grossPct,
     gross_hi_pct: round(100 * model.drop_band_hi * mult * model.capture_factor, 2),
@@ -574,13 +590,18 @@ export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string
     alloc5k_hi_usd: band(d5, model.drop_band_hi),
     net1k_usd: n1,
     net5k_usd: n5,
+    net25k_usd: n25,
     net1k_pct: netPct1,
     net5k_pct: round((100 * n5) / d5, 2),
+    net25k_pct: round((100 * n25) / d25, 2),
     verdict: netPct1 >= model.farm_net_pct ? 'FARM' : netPct1 >= model.thin_net_pct ? 'THIN' : 'SKIP',
   };
 }
 
 // ---------------------------------------------------------------- farm plans
+
+/** A signed number as text: +1.5 or -2. */
+const sgn = (n: number): string => `${n >= 0 ? '+' : ''}${n}`;
 
 /** The first chain the snapshot names for a protocol (DefiLlama lists the primary first). */
 function chainOf(p: SnapshotProtocol): string {
@@ -717,7 +738,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
   const verdictWord = farm.verdict === 'FARM' ? 'clears the FARM bar at $1,000' : farm.verdict === 'THIN' ? 'is THIN at $1,000: it pays only at the $5,000 size or with cheaper execution' : 'is a SKIP at $1,000: its model EV does not clear gas, bridge and lock-up';
   return [
     {
-      action: `Open a dedicated farming wallet for this position only (a fresh seed phrase, stored offline), and fund it with $1,000 of USDC plus the ${chain} gas token; the $5,000 column of this row's EV table is the only size at which the verdict improves.`,
+      action: `Open a dedicated farming wallet for this position only (a fresh seed phrase, stored offline) and fund it with $1,000 of USDC plus the ${chain} gas token. $1,000 is the size this ${farm.verdict} verdict is computed at; the same plan nets ${sgn(farm.net5k_pct)}% at $5,000 and ${sgn(farm.net25k_pct)}% at $25,000, because gas and bridge are fixed costs and only the carry scales.`,
       cost: `$${farm.cost1k_usd} of hard costs total: ${farm.gas_usd} gas (${MODEL.tx_count} tx on ${farm.chains_farmed.join(' + ')}), ${MODEL.bridge_usd} bridge allowance, ${farm.op1k_usd} lock-up carry`,
       time: '15 minutes',
     },
@@ -739,7 +760,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
     },
     {
       action: `Net the position: costs ${farm.cost1k_usd} dollars against the mid-band expectation leave ${farm.net1k_usd >= 0 ? '+' : ''}${farm.net1k_usd} dollars (${farm.net1k_pct}%) at $1,000 - this row is a ${farm.verdict}: ${verdictWord}. ${core.exit.charAt(0).toUpperCase() + core.exit.slice(1)} on ${chain} when the window closes. Treat the capital as venture-sized: a young ${categoryOf(p)} protocol can lose all of it to a bug or a rogue admin key.`,
-      cost: `$${farm.cost5k_usd} of hard costs at the $5,000 size (net ${farm.net5k_pct >= 0 ? '+' : ''}${farm.net5k_pct}%)`,
+      cost: `$${farm.cost5k_usd} of hard costs at $5,000 (net ${sgn(farm.net5k_pct)}%), $${farm.cost25k_usd} at $25,000 (net ${sgn(farm.net25k_pct)}%)`,
       time: '20 minutes to unwind',
     },
   ];
@@ -781,15 +802,33 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
   const meanActual = Y0.reduce((a, b) => a + b, 0) / Y0.length;
   const pen = (t: number, nz: number, lc: number) => [t, nz, nz, nz, ...cats.map(() => lc)];
 
-  // LOO-scored lambda grid: the triple that maximizes leave-one-out R2 (selection disclosed).
-  let best: { lam: [number, number, number]; m: ValMetrics } | null = null;
-  for (const t of model.lam_size_grid) for (const nz of model.lam_noise_grid) for (const lc of model.lam_category_grid) {
-    const pr = idx.map((i) => ridgeFit(F, Yw, idx.filter((j) => j !== i), pen(t, nz, lc)).predict(F[i]!));
-    const m = metrics(pr, Y0, meanActual);
-    if (best === null || m.r2 > best.m.r2) best = { lam: [t, nz, lc], m };
-  }
-  const lam = best!.lam;
+  // The penalty triple that maximizes leave-one-out R2 on the rows of `train` alone. Every caller
+  // passes only the rows it may see: the full fit all 87, a nested fold 86, a walk-forward fold its past.
+  const selectLam = (train: number[]): [number, number, number] => {
+    const ac = train.map((i) => Y0[i]!);
+    const mean = ac.reduce((a, b) => a + b, 0) / ac.length;
+    let best: { lam: [number, number, number]; r2: number } | null = null;
+    for (const t of model.lam_size_grid) for (const nz of model.lam_noise_grid) for (const lc of model.lam_category_grid) {
+      const pr = train.map((i) => ridgeFit(F, Yw, train.filter((j) => j !== i), pen(t, nz, lc)).predict(F[i]!));
+      const r2 = r2Of(pr, ac, mean);
+      if (best === null || r2 > best.r2) best = { lam: [t, nz, lc], r2 };
+    }
+    return best!.lam;
+  };
+  const lam = selectLam(idx);
   const fitRidge = ridgeFit(F, Yw, idx, pen(lam[0], lam[1], lam[2]));
+
+  // Strict nested LOO: for each comp, the penalties are re-selected by an inner LOO on the other 86
+  // and only then is the held-out comp predicted - the selection itself never sees the comp it scores.
+  const nestedLam: string[] = [];
+  const nestedPred = idx.map((i) => {
+    const train = idx.filter((j) => j !== i);
+    const l = selectLam(train);
+    nestedLam.push(l.join('/'));
+    return ridgeFit(F, Yw, train, pen(l[0], l[1], l[2])).predict(F[i]!);
+  });
+  const nestedM = metrics(nestedPred, Y0, meanActual);
+  const nestedSame = nestedLam.filter((l) => l === lam.join('/')).length;
 
   // Full LOO pass at the selected lambdas: metrics, signed residuals, scatter points.
   const looPred = idx.map((i) => ridgeFit(F, Yw, idx.filter((j) => j !== i), pen(lam[0], lam[1], lam[2])).predict(F[i]!));
@@ -810,13 +849,8 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
   for (let f = 0; f < chunks.length - 1; f++) {
     const train = [...nullIdx, ...chunks.slice(0, f + 1).flat()].sort((a, b) => a - b);
     const test = chunks[f + 1]!;
-    let sel: { lam: [number, number, number]; m: ValMetrics } | null = null;
-    for (const t of model.lam_size_grid) for (const nz of model.lam_noise_grid) for (const lc of model.lam_category_grid) {
-      const pr = train.map((i) => ridgeFit(F, Yw, train.filter((j) => j !== i), pen(t, nz, lc)).predict(F[i]!));
-      const m = metrics(pr, train.map((i) => Y0[i]!), train.reduce((a, i) => a + Y0[i]!, 0) / train.length);
-      if (sel === null || m.r2 > sel.m.r2) sel = { lam: [t, nz, lc], m };
-    }
-    const mf = ridgeFit(F, Yw, train, pen(sel!.lam[0], sel!.lam[1], sel!.lam[2]));
+    const sel = { lam: selectLam(train) };
+    const mf = ridgeFit(F, Yw, train, pen(sel.lam[0], sel.lam[1], sel.lam[2]));
     const pr = test.map((i) => mf.predict(F[i]!));
     const ac = test.map((i) => Y0[i]!);
     pooledPred.push(...pr);
@@ -826,7 +860,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
       to: comps[test[test.length - 1]!]!.listed_at!,
       train_n: train.length,
       test_n: test.length,
-      lam: sel!.lam,
+      lam: sel.lam,
       metrics: metrics(pr, ac, train.reduce((a, i) => a + Y0[i]!, 0) / train.length),
     });
   }
@@ -851,7 +885,10 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     shrinkPr.push(Math.log(comps[i]!.tvl_usd * (w * clamp(peerMedian, 0.1, 3) + (1 - w) * gm)));
     globalPr.push(Math.log(comps[i]!.tvl_usd * peerMedian));
   }
+  // TVL alone: log(mcap) on log(tvl) by OLS, the same LOO pass - what the other terms add.
+  const tvlOnly = idx.map((i) => ridgeFit(F.map((r) => [r[0]!]), Yw, idx.filter((j) => j !== i), [0]).predict([F[i]![0]!]));
   const baselines = [
+    { name: 'log-log on TVL alone (OLS)', note: 'log(mcap) = a + b*log(tvl), no category, momentum, age or breadth terms', metrics: metrics(tvlOnly, Y0, meanActual) },
     { name: 'shrink-median FDV/TVL (hand-calibrated multiples)', note: 'category median of comp FDV/TVL ratios clamped to [0.1, 3] and shrunk to the market median by w = n/(n+4): the hand-set constant this radar replaces', metrics: metrics(shrinkPr, Y0, meanActual) },
     { name: 'category median multiple (no shrinkage)', note: 'each comp priced at its own category LOO median FDV/TVL multiple', metrics: metrics(globalPr, Y0, meanActual) },
   ];
@@ -880,6 +917,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     feature_names: featureNames,
     elasticity_at_mean: round(fitRidge.beta[0]! / fitRidge.sd[0]!, 4),
     in_sample_r2: metrics(idx.map((i) => fitRidge.predict(F[i]!)), Y0, meanActual).r2,
+    nested: { metrics: nestedM, same_lam: nestedSame },
     loo: {
       metrics: looM,
       resid_q10: round(quantile(looResid, 0.1), 4),
@@ -993,6 +1031,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     verdict: s.farm.verdict,
     net_ev_pct_1000: s.farm.net1k_pct,
     net_ev_pct_5000: s.farm.net5k_pct,
+    net_ev_pct_25000: s.farm.net25k_pct,
     anchor_comps: anchorsFor(s.p, comps, 2),
     farm: s.farm,
     farm_steps: s.steps.map(stepText),
@@ -1082,6 +1121,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       verdict: s.farm.verdict,
       net_ev_pct_1000: s.farm.net1k_pct,
       net_ev_pct_5000: s.farm.net5k_pct,
+      net_ev_pct_25000: s.farm.net25k_pct,
       anchor_comps: anchorsFor(s.p, comps, 3),
       farm: s.farm,
       x: s.x,
