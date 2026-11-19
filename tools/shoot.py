@@ -3,8 +3,8 @@
 
 Serves the built /output directory with an in-process ThreadingHTTPServer (never a background
 shell job), drives the real /usr/bin/google-chrome through Playwright, captures four dossier
-screenshots at 1400x900 JPEG, and fails loudly on any console error or any request that leaves
-127.0.0.1. Usage: python3 tools/shoot.py <output_dir>
+screenshots at 1400x900 JPEG, and fails loudly on any console error, any request that leaves
+127.0.0.1, any clipped layout, and any wrong verdict colour. Usage: python3 tools/shoot.py <out>
 """
 import http.server
 import os
@@ -58,47 +58,116 @@ with sync_playwright() as pw:
     page.on("pageerror", lambda e: console_errors.append(str(e)))
     page.on("request", lambda r: requests.append(r.url))
 
-    def shot(name, quality=94):
+    def shot(name, quality=80):
         page.screenshot(path=os.path.join(SHOTS, name), type="jpeg", quality=quality)
         print(f"{name} done")
 
-    # ---- 01: the full board, drawer closed — cover shot, nothing obscured
+    # ---- 01: the full board, drawer closed — cover shot, nothing obscured, nothing overflows
     page.goto(f"{BASE}/dashboard/index.html", wait_until="load")
     page.wait_for_timeout(500)
-    state = page.evaluate("() => ({drawer: document.getElementById('drawer').classList.contains('open'), kpis: document.querySelectorAll('.kpi').length, cols: Array.from(document.querySelectorAll('#bm thead th')).map(th => Math.round(th.getBoundingClientRect().right)), rows: document.querySelectorAll('#bm tbody tr').length})")
-    if state["drawer"]:
+    st = page.evaluate("""() => ({
+      drawer: document.getElementById('drawer').classList.contains('open'),
+      kpis: document.querySelectorAll('.kpi').length,
+      cols: Array.from(document.querySelectorAll('#bm thead th')).map(th => Math.round(th.getBoundingClientRect().right)),
+      rows: document.querySelectorAll('#bm tbody tr').length,
+      scroll: document.documentElement.scrollWidth,
+      paper: getComputedStyle(document.body).backgroundColor,
+      pillF: (() => { const p = document.querySelector('.pill.SKIP'); const cs = getComputedStyle(p); return [cs.backgroundColor, cs.color, cs.fontWeight]; })(),
+      firstAnchor: document.querySelectorAll('#bm tbody tr td.anc').length,
+      light: getComputedStyle(document.querySelector('.mast h1')).color
+    })""")
+    if st["drawer"]:
         raise SystemExit("shot 01: the drawer must be closed for the cover")
-    if state["kpis"] != 6 or len(state["cols"]) != 10 or max(state["cols"]) > 1380:
-        raise SystemExit(f"shot 01: layout not fully visible: {state}")
-    print(f"shot 01 state: drawer closed, {state['kpis']} KPI cards, {len(state['cols'])} columns, rightmost edge {max(state['cols'])}, {state['rows']} rows")
+    if st["kpis"] != 7 or len(st["cols"]) != 9 or max(st["cols"]) > 1382:
+        raise SystemExit(f"shot 01: layout not fully visible: {st}")
+    if st["scroll"] > 1400:
+        raise SystemExit(f"shot 01: horizontal overflow, scrollWidth {st['scroll']}")
+    if st["paper"] != "rgb(248, 250, 252)" or st["light"] != "rgb(15, 23, 42)":
+        raise SystemExit(f"shot 01: the page is not the light print theme: {st['paper']} / {st['light']}")
+    if st["pillF"][0] != "rgb(185, 28, 28)" or st["pillF"][1] != "rgb(255, 255, 255)":
+        raise SystemExit(f"shot 01: verdict pills are not solid high-contrast: {st['pillF']}")
+    if st["firstAnchor"] < 10:
+        raise SystemExit(f"shot 01: rows lost their named anchors: {st['firstAnchor']}")
+    print(f"shot 01: drawer closed · {st['kpis']} KPIs · 9 columns, right edge {max(st['cols'])} · {st['rows']} rows · no overflow · light theme + solid pills verified")
     shot("01-board-overview.jpg")
 
-    # ---- 02: the rank-1 detail deep-dive — header KPIs, waterfall, band, gauge, farm plan
+    # ---- 02: rank-1 deep dive — verdict, anchors, EV bridge, six-step plan, page-side recompute
     page.click("#bm tbody tr:first-child")
-    page.wait_for_timeout(500)
-    state2 = page.evaluate("() => { const s = document.querySelectorAll('#drawer .plan li'); const r = s[1] && s[1].getBoundingClientRect(); return {open: document.getElementById('drawer').classList.contains('open'), title: document.querySelector('#drawer h2').textContent, step2Bottom: r ? Math.round(r.bottom) : 9999, kpis: document.querySelectorAll('#drawer .dk > div').length, wf: document.querySelectorAll('#drawer .wfrow').length}; }")
-    if not state2["open"] or state2["kpis"] != 4 or state2["wf"] != 5 or state2["step2Bottom"] > 898:
-        raise SystemExit(f"shot 02: drawer content not fully framed: {state2}")
-    print(f"shot 02 state: {state2['title']} · {state2['kpis']} KPIs · 5 waterfall stages · step 02 ends at {state2['step2Bottom']}px")
+    page.wait_for_timeout(450)
+    st2 = page.evaluate("""() => {
+      const d = document.getElementById('drawer');
+      const rc = d.querySelector('.recompute');
+      const ev = d.querySelectorAll('table.ev');
+      const steps = d.querySelectorAll('ul.plan li');
+      const r = d.getBoundingClientRect();
+      return {
+        open: d.classList.contains('open'), title: d.querySelector('h2').textContent,
+        inView: r.left >= 0 && r.right <= 1401,
+        tables: ev.length, rec: rc ? rc.textContent : '', recGood: rc ? !rc.classList.contains('off') : false,
+        steps: steps.length, lastStepBottom: steps.length ? Math.round(steps[steps.length - 1].getBoundingClientRect().bottom) : 0,
+        pill: d.querySelector('.pill') ? d.querySelector('.pill').textContent : ''
+      };
+    }""")
+    if not st2["open"] or not st2["inView"]:
+        raise SystemExit(f"shot 02: drawer not open or off-screen: {st2}")
+    if st2["tables"] != 2 or st2["steps"] != 6 or not st2["recGood"] or "✓" not in st2["rec"]:
+        raise SystemExit(f"shot 02: drawer content incomplete (2 tables, 6 steps, recompute ✓): {st2}")
+    page.evaluate("() => document.getElementById('drawer').querySelector('.recompute').scrollIntoView({block: 'center'})")
+    page.wait_for_timeout(250)
+    st3 = page.evaluate("""() => {
+      const rc = document.querySelector('#drawer .recompute').getBoundingClientRect();
+      const h2 = document.querySelector('#drawer h2').getBoundingClientRect();
+      return {recTop: Math.round(rc.top), recBottom: Math.round(rc.bottom), h2Visible: h2.bottom < 900 && h2.top > 0};
+    }""")
+    if st3["recBottom"] > 898 or st3["recTop"] < 0:
+        raise SystemExit(f"shot 02: recompute block not framed: {st3}")
+    print(f"shot 02: {st2['title']} · {st2['pill']} · anchors+EV tables · 6 plan steps · recompute ✓ inside frame")
     shot("02-protocol-detail-farm-plan.jpg")
 
-    # ---- 03: the filtered emerging radar below the $50M floor, sorted by 7d growth
+    # ---- 03: the emerging FARM set below the floor, sorted by net EV — the actionable screen
     page.keyboard.press("Escape")
-    page.wait_for_timeout(300)
-    page.select_option("#seg", "emerging")
-    page.select_option("#tier", "b5")
-    page.fill("#q", "dex")
     page.wait_for_timeout(250)
-    page.click("th button:has-text('7d')")
-    page.wait_for_timeout(400)
+    page.select_option("#seg", "emerging")
+    page.select_option("#ver", "FARM")
+    page.wait_for_timeout(250)
+    page.click("#bm thead th button[data-s='ev']")
+    page.wait_for_timeout(350)
+    st4 = page.evaluate("""() => {
+      const rows = Array.from(document.querySelectorAll('#bm tbody tr'));
+      const farmCount = rows.filter(tr => tr.querySelector('.pill.FARM')).length;
+      const belowFloor = rows.every(tr => parseFloat(tr.children[5].textContent.replace(/[^0-9.]/g, '')) < 50);
+      const evs = rows.map(tr => parseFloat(tr.children[7].firstChild.textContent));
+      const desc = evs.every((v, i) => i === 0 || v <= evs[i - 1] + 0.001);
+      return {rows: rows.length, farmCount, belowFloor, desc, top: rows.length ? rows[0].querySelector('.nm').textContent : ''};
+    }""")
+    if st4["rows"] == 0 or st4["farmCount"] != st4["rows"] or not st4["desc"] or not st4["belowFloor"]:
+        raise SystemExit(f"shot 03: the filter did not hold (all rows FARM, EV desc): {st4}")
+    print(f"shot 03: {st4['rows']} emerging FARM picks · every row below the floor · EV descending · top: {st4['top']}")
     shot("03-filtered-emerging-radar.jpg")
 
-    # ---- 04: the methodology — the model panel, the peer multiples, the backtest
-    page.fill("#q", "")
-    page.click("button.reset")
-    page.wait_for_timeout(400)
-    page.evaluate("window.scrollTo(0, document.querySelector('.grid2').getBoundingClientRect().top + window.scrollY - 140)")
-    page.wait_for_timeout(300)
+    # ---- 04: the methodology — the fitted equation, both validations drawn, the funnel identity
+    page.select_option("#seg", "all")
+    page.select_option("#ver", "all")
+    page.wait_for_timeout(250)
+    page.click("button[data-v='model']")
+    page.wait_for_timeout(450)
+    st5 = page.evaluate("""() => {
+      const svg = document.querySelectorAll('.view svg.plot');
+      const loo = svg[0] ? svg[0].querySelectorAll('circle').length : 0;
+      const bars = svg.length > 1 ? svg[1].querySelectorAll('rect').length : 0;
+      const idn = document.querySelector('.idn');
+      const fnl = document.querySelectorAll('.fnl .fn').length;
+      const coef = document.querySelectorAll('.panel table.mini')[0];
+      return {svgs: svg.length, loo, bars, idn: idn ? idn.textContent : '', fnl, coefRows: coef ? coef.querySelectorAll('tbody tr').length : 0,
+              eq: document.querySelector('.eq') ? document.querySelector('.eq').textContent : '', scroll: document.documentElement.scrollWidth};
+    }""")
+    if st5["svgs"] != 2 or st5["loo"] != 87 or st5["bars"] != 87:
+        raise SystemExit(f"shot 04: the LOO scatter and residual strip must draw all 87 comps: {st5}")
+    if "758" not in st5["idn"] or "MISMATCH" in st5["idn"] or "log(mcap_usd)" not in st5["eq"]:
+        raise SystemExit(f"shot 04: funnel identity or equation missing: {st5['idn'][:90]}")
+    if st5["coefRows"] < 8 or st5["fnl"] < 7 or st5["scroll"] > 1400:
+        raise SystemExit(f"shot 04: methodology not fully rendered: {st5}")
+    print(f"shot 04: equation shown · {st5['coefRows']} coefficients · LOO scatter 87 pts · residual strip 87 bars · {st5['fnl']} funnel lines · identity reads: …{st5['idn'][-52:]}")
     shot("04-model-methodology.jpg")
 
     browser.close()

@@ -2,16 +2,16 @@
 // library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>, or
-// MAKEFUN_INPUT_DIR), scores every pre-token protocol with the peer-calibrated model in
+// MAKEFUN_INPUT_DIR), scores every pre-token protocol with the fitted log-linear ridge model in
 // lib/model.ts, writes the ranked board to /output/board.json, writes the dashboard's data to
 // /output/data.js, copies this repository's dashboard/ and screenshots/ to /output, and writes
 // /output/dossier.json with the vendored make.fun library.
 //
-// The model calibrates category FDV/TVL multiples from the snapshot's own tokenized protocols,
-// then scores each pre-token protocol as tvl x peer_multiple x momentum x maturity x breadth. The
-// board covers the whole watchlist plus every pre-token protocol below the floor that passes the
-// house's product screens; tokenized protocols are kept apart as the model's comps, and pre-token
-// protocols above the floor that the house's rule set aside are flagged, never ranked.
+// The model fits log(mcap) ~ log(tvl) + category fixed effects + 7d change + log(age) + log(chains)
+// on the snapshot's own tokenized comps, validates it leave-one-out AND on temporal walk-forward
+// folds, then prices each pre-token protocol at the fit and nets a deposit-sized farm EV around it.
+// Tokenized protocols are kept apart as the model's evidence, never ranked; pre-token protocols the
+// product screens catch are set aside with their exact reason and counted in the 758-protocol funnel.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -97,6 +97,7 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.kpis.watchlist} watchlist, ${radar.kpis.emerging} emerging, ${radar.live.length} tokenized comps, ${radar.aside.length} set aside)\n` +
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.kpis.watchlist} watchlist, ${radar.kpis.emerging} emerging, ${radar.kpis.comps} tokenized comps fitted, ${radar.kpis.aside_above + radar.kpis.excluded_below} screened out)\n` +
+    `token radar: LOO R2 ${radar.fit.loo.metrics.r2} rho ${radar.fit.loo.metrics.rho} med|log err| ${radar.fit.loo.metrics.med_abs_log_err}; walk-forward pooled rho ${radar.fit.wf.pooled.rho}; verdicts FARM ${radar.kpis.farm} / THIN ${radar.kpis.thin} / SKIP ${radar.kpis.skip}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dash.length} files, ${dashBytes} bytes), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
