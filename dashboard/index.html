@@ -3,12 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar: pre-token protocols ranked by implied value</title>
+<title>Kestrel — Token Launch Radar</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <a class="skip" href="#board">Skip to the board</a>
-<main id="board" tabindex="-1" aria-busy="true"></main>
+<main id="board" class="wrap" aria-busy="true"></main>
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" aria-label="Protocol detail" aria-hidden="true"></aside>
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
