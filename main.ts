@@ -8,8 +8,9 @@
 // /output/dossier.json with the vendored make.fun library.
 //
 // The model fits log(mcap) ~ log(tvl) + pass-through family on the snapshot's own traded comps, with
-// sign-constrained 7-day growth and seasoning terms chosen inside an economic box by leave-one-out;
-// it validates LOO, nested LOO and walk-forward, then prices each pre-token protocol and nets a
+// sign-constrained 7-day growth and seasoning terms chosen inside an economic box by leave-one-out,
+// fits a logistic launch curve on all 758 protocols for the odds of a token within 12 months, validates
+// both blind (LOO and walk-forward), then prices each pre-token protocol and nets a two-outcome,
 // deposit-sized farm plan ($1k / $10k / $50k) around it.
 // Tokenized protocols are kept apart as the model's evidence, never ranked; pre-token protocols the
 // product screens catch are set aside with their exact reason and counted in the 758-protocol funnel.
@@ -101,6 +102,7 @@ const v = radar.verdicts;
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${board.length} ranked (${radar.funnel.watchlist} watchlist + ${radar.funnel.emerging} emerging), ${radar.fit.n_comps} traded comps fitted\n` +
     `token radar: LOO R2 ${radar.fit.loo.r2} rho ${radar.fit.loo.rho}; nested LOO R2 ${radar.fit.nested.r2} rho ${radar.fit.nested.rho}; walk-forward pooled R2 ${radar.fit.wf.pooled.r2} rho ${radar.fit.wf.pooled.rho}; k ${radar.fit.k} d ${radar.fit.d} lam ${radar.fit.lam}\n` +
-    `token radar: verdicts FARM/THIN/SKIP at $1k ${v['1000']!.FARM}/${v['1000']!.THIN}/${v['1000']!.SKIP}, $10k ${v['10000']!.FARM}/${v['10000']!.THIN}/${v['10000']!.SKIP}, $50k ${v['50000']!.FARM}/${v['50000']!.THIN}/${v['50000']!.SKIP}\n` +
+    `token radar: P(token) launch curve on ${radar.odds.n} protocols [${radar.odds.terms.join(', ')}]: LOO Brier ${radar.odds.loo.brier} (base rate ${radar.odds.loo.base_brier}) log-loss ${radar.odds.loo.logloss} AUC ${radar.odds.loo.auc}; walk-forward Brier ${radar.odds.wf.pooled.brier} AUC ${radar.odds.wf.pooled.auc}\n` +
+    `token radar: two-outcome verdicts FARM/THIN/SKIP at $1k ${v['1000']!.FARM}/${v['1000']!.THIN}/${v['1000']!.SKIP}, $10k ${v['10000']!.FARM}/${v['10000']!.THIN}/${v['10000']!.SKIP}, $50k ${v['50000']!.FARM}/${v['50000']!.THIN}/${v['50000']!.SKIP}\n` +
     `token radar: wrote board.json, data.js, dashboard/ (${dash.length} files, ${dashBytes} bytes), screenshots/ (${shots.length}) and dossier.json to ${out}\n`,
 );

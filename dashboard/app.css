@@ -171,23 +171,14 @@ i.FARM, .mix i.FARM { background:var(--farm); } i.THIN { background:var(--thin);
 .chart .be { stroke:var(--thin); stroke-dasharray:3 3; }
 .chart text.farm { fill:var(--farm); }
 .chart text.be { fill:var(--thin); }
-.chart .floor { stroke:var(--mute); stroke-dasharray:5 4; }
 .chart .diag { stroke:var(--ink2); stroke-dasharray:4 3; }
 .chart .band2 { fill:rgba(56, 189, 248, .08); }
 .chart circle { stroke-width:1.2; }
-.chart circle[data-slug] { cursor:pointer; }
-.chart .FARM { fill:var(--farm); fill-opacity:.85; stroke:#03200f; }
-.chart .THIN { fill:var(--thin); fill-opacity:.8; stroke:#2a1d05; }
-.chart .SKIP { fill:#475569; fill-opacity:.9; stroke:#1b2331; }
-.chart .w { stroke:#e6ebf2; stroke-width:1.6; }
 .chart .in { fill:var(--farm); fill-opacity:.75; stroke:none; }
 .chart .out { fill:var(--neg); fill-opacity:.6; stroke:none; }
-.legend { color:var(--ink2); font-size:11.5px; margin:8px 0 0; display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; }
-.legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:-6px; vertical-align:-1px; }
-.legend i.ring { border:1.6px solid var(--ink); }
 
-/* ---------- traded and set-aside */
-.scroll { max-height:700px; overflow-y:auto; }
+/* ---------- audit */
+.scroll { max-height:560px; overflow-y:auto; margin-top:8px; }
 .why { color:var(--ink2); font-size:11.5px; }
 
 /* ---------- methodology */
@@ -202,18 +193,13 @@ i.FARM, .mix i.FARM { background:var(--farm); } i.THIN { background:var(--thin);
 .cfb i.pos { background:var(--farm); } .cfb i.neg { background:var(--neg); }
 .cf b { text-align:right; font-variant-numeric:tabular-nums; }
 .cf em { font-style:normal; color:var(--farm); font-size:11px; text-align:right; white-space:nowrap; }
-.heat th, .heat td { font-size:11px; padding:3px 6px; text-align:center; font-variant-numeric:tabular-nums; }
-.heat th { color:var(--mute); font-weight:600; }
-.heat td { background:rgba(56, 189, 248, calc(.06 + .4 * var(--a))); border:1px solid var(--bg); }
-.heat td.pick { outline:2px solid var(--farm); outline-offset:-2px; font-weight:800; }
 .stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; margin-top:8px; }
 .stats div { background:var(--p2); border:1px solid var(--line); border-radius:5px; padding:5px 8px; }
 .stats label { display:block; font-size:9.5px; color:var(--mute); text-transform:uppercase; letter-spacing:1px; font-weight:700; }
 .stats b { font-size:17px; font-variant-numeric:tabular-nums; }
 .funnel { display:flex; height:26px; border-radius:4px; overflow:hidden; gap:2px; }
 .funnel i { display:flex; align-items:center; justify-content:center; font-style:normal; font-weight:700; font-size:12px; color:#fff; min-width:28px; }
-i.comps { background:#475569; } i.tok { background:#334155; } i.W { background:#0369a1; } i.E { background:#6d28d9; } i.as { background:#854d0e; } i.sc { background:#7f1d1d; }
-.legend i.comps, .legend i.tok, .legend i.W, .legend i.E, .legend i.as, .legend i.sc { border-radius:2px; }
+i.W { background:#0369a1; } i.E { background:#6d28d9; } i.C { background:#475569; } i.K { background:#334155; } i.A { background:#854d0e; } i.X { background:#7f1d1d; }
 
 /* ---------- basket, watchlist marks */
 .bk { border-top:2px solid var(--farm); }
@@ -232,31 +218,37 @@ ol.bkl span { grid-row:1 / span 2; grid-column:4; text-align:right; font-variant
 .matrix .fo::after { content:" ◆"; color:var(--cy); }
 .matrix .ac::after { content:" ▲"; color:#c4b5fd; }
 b.fo { color:var(--cy); } b.ac { color:#c4b5fd; }
-.fobar { margin:10px 0 0; padding:7px 11px; border:1px solid #1d5d80; background:#0a2231; border-radius:6px; color:var(--ink); font-size:12px; }
 
-/* ---------- drawer: scenarios, peers */
-.scn { display:flex; gap:4px; margin:0 0 6px; }
-.scn button { flex:1; border:1px solid var(--line2); background:var(--p2); border-radius:5px; padding:3px 4px; font-size:10.5px; font-weight:700; color:var(--ink2); cursor:pointer; white-space:nowrap; }
-.scn button.on { border-color:var(--cy); color:var(--cy); background:var(--cy2); }
+/* ---------- drawer: peers, odds */
 .chart rect.me { fill:var(--cy); } .chart rect.pr { fill:#3e4b60; } .chart rect.dr { fill:#31445f; }
 .chart text.me { fill:var(--cy); font-weight:700; } .chart text.v { fill:var(--ink); font-size:10px; }
 
-/* ---------- radar map, yield matrix, cards */
-.chart.map text.cl { font:600 11px var(--sans); paint-order:stroke; stroke:var(--p1); stroke-width:3px; }
-.chart text.cl.FARM { fill:#86efac; } .chart text.cl.THIN { fill:#fcd34d; } .chart text.cl.SKIP { fill:var(--ink2); }
-.chart text.note { fill:var(--dim); font-style:italic; }
-.chart.map circle { fill-opacity:.6; }
-.rv { margin-top:12px; }
-.ym th, .ym td { padding:4px 6px; font-size:11.5px; border:1px solid var(--bg); text-align:center; font-variant-numeric:tabular-nums; }
-.ym th { color:var(--mute); font-weight:600; font-size:10.5px; white-space:nowrap; }
-.ym tr th:first-child { text-align:left; color:var(--ink2); }
-.ym td small { margin-left:5px; font-size:9.5px; }
-.ym td.FARM { background:var(--farm2); color:var(--farm); font-weight:700; } .ym td.THIN { background:var(--thin2); color:#f7c46c; } .ym td.SKIP { background:var(--skip2); color:var(--skip); } .ym td.e { color:var(--dim); }
-.cards { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
-.card { position:relative; background:var(--p2); border:1px solid var(--line); border-left:3px solid var(--farm); border-radius:6px; padding:6px 9px 6px 26px; cursor:pointer; min-width:0; }
-.card:hover { border-color:var(--cy); }
-.card i { position:absolute; left:8px; top:7px; font-style:normal; font-weight:800; color:var(--farm); }
-.card b { display:block; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:54px; }
-.card em { position:absolute; right:9px; top:6px; font-style:normal; font-weight:800; font-size:14px; }
-.card small { display:block; font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* ---------- v7: integrity strip, odds, two-outcome rows, audit, breakdown */
+.strip { display:flex; align-items:center; gap:6px; margin-top:10px; padding:6px 12px; background:#071a12; border:1px solid #14532d; border-radius:6px; font-size:12px; color:var(--ink2); }
+.strip span { margin-right:14px; } .strip span b { color:var(--ink); }
+b.ck { color:var(--farm); font-size:13px; } b.bad { color:var(--neg); }
+.pt { width:84px; } .pt b { font-variant-numeric:tabular-nums; }
+.pbar { height:5px; background:var(--p2); border-radius:3px; margin-top:4px; overflow:hidden; } .pbar i { display:block; height:100%; background:#a78bfa; }
+.hb { display:grid; grid-template-columns:120px 1fr 26px; gap:8px; align-items:center; font-size:12px; padding:2px 0; color:var(--ink2); }
+.hb i { height:10px; background:var(--farm); border-radius:2px; } .hb b { text-align:right; font-variant-numeric:tabular-nums; }
+.odds { display:grid; grid-template-columns:repeat(3, 1fr); gap:5px; }
+.odds div { background:var(--p2); border:1px solid var(--line); border-radius:5px; padding:4px 8px; }
+.odds label { display:block; font-size:9px; text-transform:uppercase; letter-spacing:.8px; color:var(--mute); font-weight:700; white-space:nowrap; }
+.odds b { display:block; font-size:16px; font-variant-numeric:tabular-nums; } .odds small { font-size:10px; }
+b.cy, .cy { color:#c4b5fd; }
+.fe tr.sec td { font-size:9.5px; text-transform:uppercase; letter-spacing:1px; font-weight:800; color:#c4b5fd; padding-top:6px; border-bottom-color:var(--line2); }
+.fe tr.hi td { background:var(--p2); } .fe tr.hi td.cur { background:#0c2433; }
+.mono4 div { display:flex; justify-content:space-between; gap:8px; padding:3px 0; text-align:right; border-bottom:1px solid var(--line); font-size:12px; color:var(--ink2); }
+.stats b i { font-style:normal; font-size:11px; color:var(--mute); font-weight:500; }
+.chart .cal { fill:#a78bfa; fill-opacity:.85; stroke:#1b1533; } .chart polyline.cl { stroke:#a78bfa; stroke-width:1.6; }
+.mt.gap { margin-top:10px; }
+.filters.au { margin:10px 0 0; } .filters.au .chips button { display:flex; align-items:center; gap:5px; }
+i.dot { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:6px; vertical-align:0; }
+.disp { font-size:10.5px; font-weight:700; padding:1px 6px; border-radius:3px; background:var(--p2); color:var(--ink2); white-space:nowrap; }
+.disp.W { color:var(--cy); } .disp.E { color:#c4b5fd; }
+.mt.au td { vertical-align:top; } tr.lnk { cursor:pointer; } tr.lnk:hover { background:var(--p2); }
 .fsr td { padding:3px 6px; font-size:11.5px; } .fsr td.up { color:var(--pos); } .fsr td.up::before { content:"▲ "; font-size:9px; }
+.acc { display:grid; grid-template-columns:repeat(3, 1fr); gap:5px; }
+.acc div { background:var(--p2); border:1px solid var(--line); border-radius:5px; padding:4px 8px; } .acc b { font-size:15px; font-variant-numeric:tabular-nums; } .acc small { display:block; font-size:10px; white-space:nowrap; }
+.stats small { display:block; font-size:10px; }

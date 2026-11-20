@@ -1,4 +1,5 @@
-// Kestrel Token Radar: the fitted valuation model, the farm planner and the board builder (kestrel-7).
+// Kestrel Token Radar: the fitted valuation model, the launch-odds model, the two-outcome farm planner
+// and the board builder (kestrel-8, v7).
 //
 // One sealed snapshot in, one ranked board out. Every number derives from the snapshot's ten fields;
 // no protocol name is special-cased anywhere.
@@ -25,25 +26,37 @@
 // - validation     LOO (87 blind refits); strict nested LOO (penalty AND record box re-selected inside
 //                  each of the 87 folds); temporal walk-forward (4 listed_at cohorts, train on older,
 //                  predict newer, selection re-run per fold); baselines under the same LOO pass.
-// - v6 search      13 designs (interaction and split elasticities, a 3-family taxonomy, category / chain
-//                  FE, chain footprint, category share and rank, Huber loss) each run this whole protocol
+// - v6/v7 search   15 designs (interaction and split elasticities, a 3-family taxonomy, category / chain
+//                  FE, chain footprint, category share and rank, Huber loss, log TVL squared, the category token rate
+//                  of all 758 peers) each run this whole protocol
 //                  with their own (lam, k, d). A design ships only if it beats the kept one on LOO R2 and
-//                  walk-forward rho together; none does, so kestrel-7 keeps the v5 two-feature core.
+//                  walk-forward rho together; none does, so kestrel-8 keeps the v5 two-feature core.
 //
-// FARM PLANNER (deposit-sized, recomputed live by the page for $1k / $10k / $50k)
+// LAUNCH ODDS (fitted on all 758 protocols: 416 record a token, 342 do not)
+//
+//   F(a) = sigmoid(b0 + b*z(log age) + b*z(undated) + b*z(category rate) + b*z(log TVL))
+//   P(token within 365 days | none at age a) = (F(a + 365) - F(a)) / (1 - F(a))
+//
+// F is the cumulative launch curve read off the cross-section (the share of look-alike protocols
+// that carry a token by age a); category rate is the empirical-Bayes logit of the category's token
+// share, encoded out-of-fold. L2 logistic, penalty chosen by exact LOO log-loss. Validated blind
+// twice: 758 exact LOO refits (Brier, log-loss, ROC-AUC, calibration by quintile) and walk-forward
+// by listing date with the penalty re-selected per fold. Terms enter by forward search only if they
+// lower both held-out log-losses; 7-day growth must also enter with a non-negative sign.
+//
+// FARM PLANNER (two outcomes, deposit-sized, recomputed live by the page for $1k / $10k / $50k)
 //
 //   EV_q  = deposit/TVL x drop_q x route_share x FDV_q x time_share          (q = p25 / p50 / p75)
-//   net_q = EV_q - gas - bridge - deposit x (benchmark + risk premium - base APY) x weeks/52
+//   A (P):     net_if = EV_q - costs            B (1 - P):  net_none = -costs
+//   blended net_q = P x EV_q - costs,  costs = gas + bridge + deposit x (benchmark + premium - base APY) x weeks/52
 //
 // The deposit sits in the protocol's own yield product, so its base APY offsets the carry of locked
-// capital (a vault paying more than the 4.5% benchmark plus its risk premium carries for free).
-// drop_q are the p25/p50/p75 community-drop shares of twelve documented launches; route_share is the
-// part of a drop the deposit route earns (0.75 for deposit products, 0.4 for trading venues); and
-// time_share is the part of the points season the deposit is present for (the window over the
-// window plus up to 180 days already accrued). FARM needs a p50 net APR of 8%+ with a p25 that does
-// not lose; THIN is any positive p50 (a free option on capital already parked there); SKIP is the
-// rest. Every figure is the
-// model's claim, never a promise, and the board predicts no launch: it prices one if it happens.
+// capital either way. drop_q are the p25/p50/p75 community-drop shares of twelve documented
+// launches; route_share is the part of a drop the deposit route earns (0.75 deposit products, 0.4
+// trading venues); time_share is the part of the points season the deposit is present for. FARM
+// needs a blended p50 net APR of 4%+ (already above the 4.5% benchmark and the route's risk premium)
+// with a p25 that does not lose; THIN is any positive blended p50; SKIP is the rest. Every figure is
+// the model's claim, never a promise.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -68,7 +81,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'kestrel-7';
+export const MODEL_VERSION = 'kestrel-8';
 
 /** Every constant the model and the planner use; data.js ships them and the page recomputes from them. */
 export const MODEL = {
@@ -92,10 +105,16 @@ export const MODEL = {
   tx_per_weeks: 4,
   bridge_usd: 3,
   gas_default_usd: 0.3,
-  farm_apr: 8,
+  farm_apr: 4,
   farm_p25_apr: 0,
   whale_tvl_share: 0.01,
   basket_n: 4,
+  basket_cat_max: 2,
+  // ---- launch odds
+  odds_horizon_days: 365,
+  odds_lam_grid: [0.001, 0.01, 0.1],
+  odds_m: 10,
+  odds_age_pad_days: 30,
 };
 export type ModelConstants = typeof MODEL;
 
@@ -284,6 +303,10 @@ function candidateDesigns(comps: SnapshotProtocol[], snapshot: Snapshot): Design
   const ps = (p: SnapshotProtocol) => (PASS_THROUGH.has(categoryOf(p)) ? 1 : 0);
   const lc = (p: SnapshotProtocol) => Math.log(Math.max(1, p.chains.length));
   const rankIn = (p: SnapshotProtocol) => Math.log(1 + snapshot.protocols.filter((q) => categoryOf(q) === categoryOf(p) && q.tvl_usd > p.tvl_usd).length);
+  const tok = new Map<string, [number, number]>();
+  for (const p of snapshot.protocols) { const t = tok.get(categoryOf(p)) ?? [0, 0]; tok.set(categoryOf(p), [t[0] + 1, t[1] + (isPreToken(p) ? 0 : 1)]); }
+  const pbar = snapshot.protocols.filter((p) => !isPreToken(p)).length / snapshot.protocols.length;
+  const peer = (p: SnapshotProtocol) => { const [n, k] = tok.get(categoryOf(p))!; const r = (k + 10 * pbar) / (n + 10); return Math.log(r / (1 - r)); };
   const D = (name: string, f: (p: SnapshotProtocol) => number[], nonneg: boolean[] = [true], huber = 0): Design => ({ name, f, nonneg, huber });
   return [
     D('log TVL alone', (p) => [lt(p)]),
@@ -299,6 +322,8 @@ function candidateDesigns(comps: SnapshotProtocol[], snapshot: Snapshot): Design
     D('+ category TVL share', (p) => [lt(p), ps(p), Math.log(p.tvl_usd / catTvl.get(categoryOf(p))!)]),
     D('+ TVL rank inside category', (p) => [lt(p), ps(p), rankIn(p)]),
     D('v5 design, Huber loss (c 1.345)', (p) => [lt(p), ps(p)], [true], 1.345),
+    D('v7: + (log TVL)² curvature', (p) => [lt(p), ps(p), (lt(p) - 18) ** 2]),
+    D('v7: + category token rate (758 peers)', (p) => [lt(p), ps(p), peer(p)]),
   ];
 }
 
@@ -480,6 +505,216 @@ export function impliedLog(fit: ModelFit, x: number[], change7d: number | null, 
   return { base, growth: r.growth, season: r.season, total: base + r.growth + r.season };
 }
 
+// ---------------------------------------------------------------- launch odds P(token)
+//
+// The snapshot holds 758 protocols, 416 of which already record a token. Read as cohorts, the share
+// of protocols that carry a token by age a estimates the cumulative launch curve F(a | category,
+// size, footprint). A regularized logistic regression fits F on all 758; its skill is measured
+// blind twice (exact leave-one-out refits, and walk-forward by listing date with the penalty
+// re-selected inside each fold). A protocol still without a token at age a then launches within
+// the next H days with odds
+//
+//   P(token) = (F(a + H) - F(a)) / (1 - F(a))
+//
+// the conditional of the fitted curve. Old protocols with no token, and categories that rarely
+// issue one (curators, allocators), get low odds; young protocols in token-dense categories high.
+
+/** A fitted logistic on standardized columns. */
+export interface Logit { mu: number[]; sd: number[]; beta: number[]; b0: number }
+const sigmoid = (t: number): number => 1 / (1 + Math.exp(-t));
+
+/** L2-penalized logistic regression by Newton steps (intercept free), optionally warm-started. */
+function logit(X: number[][], y: number[], idx: number[], lam: number, warm?: Logit): Logit {
+  const k = X[0]!.length, n = idx.length;
+  const mu = new Array<number>(k).fill(0), sd = new Array<number>(k).fill(0);
+  for (const i of idx) for (let j = 0; j < k; j++) mu[j]! += X[i]![j]! / n;
+  for (const i of idx) for (let j = 0; j < k; j++) sd[j]! += (X[i]![j]! - mu[j]!) ** 2 / n;
+  for (let j = 0; j < k; j++) sd[j] = Math.sqrt(sd[j]!) || 1;
+  let th = warm ? [warm.b0, ...warm.beta] : new Array<number>(k + 1).fill(0);
+  const K = k + 1, Z = idx.map((i) => { const z = new Float64Array(K); z[0] = 1; for (let j = 0; j < k; j++) z[j + 1] = (X[i]![j]! - mu[j]!) / sd[j]!; return z; });
+  for (let it = 0; it < 30; it++) {
+    const g = new Array<number>(K).fill(0);
+    const H = th.map(() => new Array<number>(K).fill(0));
+    for (let a = 0; a < n; a++) {
+      const z = Z[a]!;
+      let t = 0;
+      for (let j = 0; j < K; j++) t += z[j]! * th[j]!;
+      const p = sigmoid(t), w = Math.max(p * (1 - p), 1e-9), r = y[idx[a]!]! - p;
+      for (let u = 0; u < K; u++) { g[u]! += r * z[u]!; const hu = H[u]!, wz = w * z[u]!; for (let v = u; v < K; v++) hu[v]! += wz * z[v]!; }
+    }
+    for (let u = 0; u < K; u++) for (let v = 0; v < u; v++) H[u]![v] = H[v]![u]!;
+    for (let u = 1; u < K; u++) { g[u]! -= lam * n * th[u]!; H[u]![u]! += lam * n; }
+    const step = solve(H, g);
+    th = th.map((v, j) => v + step[j]!);
+    if (Math.max(...step.map(Math.abs)) < 1e-7) break;
+  }
+  return { mu, sd, b0: th[0]!, beta: th.slice(1) };
+}
+export const predictLogit = (m: Logit, x: number[]): number => sigmoid(x.reduce((a, v, j) => a + m.beta[j]! * ((v - m.mu[j]!) / m.sd[j]!), m.b0));
+
+/** Held-out classification metrics. */
+export interface ProbMetrics { n: number; brier: number; logloss: number; auc: number; base_brier: number; bss: number }
+function probMetrics(p: number[], y: number[], base: number[]): ProbMetrics {
+  const n = y.length;
+  const brier = p.reduce((a, v, i) => a + (v - y[i]!) ** 2, 0) / n;
+  const bb = base.reduce((a, v, i) => a + (v - y[i]!) ** 2, 0) / n;
+  const ll = -p.reduce((a, v, i) => a + Math.log(clamp(y[i] ? v : 1 - v, 1e-6, 1)), 0) / n;
+  const r = ranks(p), pos = y.reduce((a, v) => a + v, 0);
+  const sumPos = r.reduce((a, v, i) => a + (y[i] ? v + 1 : 0), 0);
+  const auc = pos > 0 && pos < n ? (sumPos - (pos * (pos + 1)) / 2) / (pos * (n - pos)) : 0.5;
+  return { n, brier: round(brier, 4), logloss: round(ll, 4), auc: round(auc, 4), base_brier: round(bb, 4), bss: round(1 - brier / bb, 4) };
+}
+
+export interface OddsDesign { name: string; terms: string[]; loo: ProbMetrics; wf: ProbMetrics; lam: number; chosen: boolean }
+export interface OddsFit {
+  horizon_days: number;
+  n: number; n_token: number;
+  terms: string[]; lam: number; m: number;
+  mu: number[]; sd: number[]; beta: number[]; b0: number;
+  cat_logit: Record<string, number>; prior_logit: number;
+  loo: ProbMetrics; wf: { folds: { from: string; to: string; train_n: number; test_n: number; metrics: ProbMetrics }[]; pooled: ProbMetrics };
+  calib: { pred: number; obs: number; n: number }[];
+  designs: OddsDesign[];
+  loo_p: Record<string, number>;
+}
+
+/** The odds model's raw columns for one protocol at an age (days, null = undated), by term name. */
+export function oddsRow(terms: string[], p: { tvl_usd: number; chains: string[]; change_7d: number | null }, age: number | null, catLogit: number, model: ModelConstants = MODEL): number[] {
+  const a = age ?? model.unknown_age_days;
+  const col: Record<string, number> = {
+    'log age': round(Math.log((a + model.odds_age_pad_days) / 365), 6),
+    undated: age === null ? 1 : 0,
+    'category rate': round(catLogit, 6),
+    'log TVL': round(Math.log(p.tvl_usd), 4),
+    'log chains': round(Math.log(Math.max(1, p.chains.length)), 4),
+    '7d growth': clamp(p.change_7d ?? 0, -model.growth_cap_pct, model.growth_cap_pct) / 100,
+  };
+  return terms.map((t) => col[t]!);
+}
+
+/** P(token within H days | none at age a) from a fitted curve: (F(a+H) - F(a)) / (1 - F(a)). */
+export function launchOdds(fa: number, fb: number): number { return round(clamp((fb - fa) / Math.max(1e-9, 1 - fa), 0, 1), 4); }
+
+/** Fit the launch curve on every protocol in the snapshot and validate it blind, twice. */
+export function fitOdds(snapshot: Snapshot, model: ModelConstants = MODEL): OddsFit {
+  const P = [...snapshot.protocols].sort((a, b) => byStr(a.slug, b.slug));
+  const y = P.map((p) => (isPreToken(p) ? 0 : 1));
+  const ages = P.map((p) => ageDays(snapshot.as_of, p.listed_at));
+  const cats = P.map(categoryOf);
+  const m = model.odds_m;
+  /** Empirical-Bayes logit of each category's token rate over `train`, leaving `skip` out of its own. */
+  const eb = (train: number[]) => {
+    const n = new Map<string, number>(), k = new Map<string, number>();
+    let N = 0, K = 0;
+    for (const i of train) { n.set(cats[i]!, (n.get(cats[i]!) ?? 0) + 1); k.set(cats[i]!, (k.get(cats[i]!) ?? 0) + y[i]!); N++; K += y[i]!; }
+    const pbar = K / N;
+    return (c: string, self: number) => {
+      const nc = (n.get(c) ?? 0) - (self >= 0 ? 1 : 0), kc = (k.get(c) ?? 0) - (self >= 0 ? self : 0);
+      const r = (kc + m * pbar) / (nc + m);
+      return Math.log(r / (1 - r));
+    };
+  };
+  const all = P.map((_, i) => i);
+  /** Rows for a fold: training rows encode their category without themselves, test rows with the whole train. */
+  const fixed = new Map<string, number[][]>();
+  const matrix = (terms: string[], train: number[]) => {
+    const key = terms.join('|');
+    if (!fixed.has(key)) fixed.set(key, P.map((p, i) => oddsRow(terms, p, ages[i]!, 0, model)));
+    const base = fixed.get(key)!, ci = terms.indexOf('category rate');
+    if (ci < 0) return base;
+    const e = eb(train), inTrain = new Uint8Array(P.length);
+    for (const i of train) inTrain[i] = 1;
+    return base.map((row, i) => { const r = row.slice(); r[ci] = round(e(cats[i]!, inTrain[i] ? y[i]! : -1), 6); return r; });
+  };
+  const usesCat = (terms: string[]) => terms.includes('category rate');
+  /** Exact leave-one-out predictions over `train` (a refit per row, warm-started from the train fit). */
+  const looOver = (terms: string[], train: number[], lam: number) => {
+    const Xt = matrix(terms, train);
+    const full = logit(Xt, y, train, lam);
+    return train.map((i) => {
+      const rest = train.filter((j) => j !== i);
+      const X = usesCat(terms) ? matrix(terms, rest) : Xt;
+      return predictLogit(logit(X, y, rest, lam, full), X[i]!);
+    });
+  };
+  const ll = (p: number[], idx: number[]) => probMetrics(p, idx.map((i) => y[i]!), idx.map(() => 0.5)).logloss;
+  const pick = (terms: string[], train: number[]) => {
+    let best = model.odds_lam_grid[0]!, bestL = Infinity, bestP: number[] = [];
+    for (const lam of model.odds_lam_grid) { const p = looOver(terms, train, lam); const l = ll(p, train); if (l < bestL) { bestL = l; best = lam; bestP = p; } }
+    return { lam: best, p: bestP };
+  };
+  const dated = all.filter((i) => ages[i] !== null).sort((a, b) => byStr(P[a]!.listed_at!, P[b]!.listed_at!) || a - b);
+  const undated = all.filter((i) => ages[i] === null);
+  const C = model.wf_cohorts;
+  const chunks = [...Array(C).keys()].map((q) => dated.slice(Math.floor((q * dated.length) / C), Math.floor(((q + 1) * dated.length) / C)));
+  /** Out-of-fold base rate of the training rows, for the Brier skill baseline. */
+  const rate = (idx: number[]) => idx.reduce((a, i) => a + y[i]!, 0) / idx.length;
+  const walk = (terms: string[]) => {
+    const folds: OddsFit['wf']['folds'] = [];
+    const wp: number[] = [], wy: number[] = [], wb: number[] = [];
+    for (let f = 1; f < C; f++) {
+      const train = [...undated, ...chunks.slice(0, f).flat()].sort((a, b) => a - b), test = chunks[f]!;
+      const { lam } = pick(terms, train);
+      const X = matrix(terms, train), mfit = logit(X, y, train, lam);
+      const pr = test.map((i) => predictLogit(mfit, X[i]!)), base = test.map(() => rate(train));
+      wp.push(...pr); wy.push(...test.map((i) => y[i]!)); wb.push(...base);
+      folds.push({ from: P[test[0]!]!.listed_at!, to: P[test[test.length - 1]!]!.listed_at!, train_n: train.length, test_n: test.length, metrics: probMetrics(pr, test.map((i) => y[i]!), base) });
+    }
+    return { folds, pooled: probMetrics(wp, wy, wb) };
+  };
+  const looBase = all.map((i) => (rate(all) * all.length - y[i]!) / (all.length - 1));
+
+  // Forward search: each candidate term is kept only if it lowers BOTH the blind LOO log-loss and
+  // the walk-forward log-loss of the design so far. 7-day growth must also enter with a sign >= 0:
+  // pre-token protocols run points campaigns that pull TVL in, so a negative cross-sectional sign is
+  // that campaign effect (reverse causality), not lower launch odds, and cannot enter a hazard.
+  const ladder = ['category rate', 'log TVL', 'log chains', '7d growth'];
+  let terms = ['log age', 'undated'];
+  const score = (t: string[]) => { const s = pick(t, all); return { lam: s.lam, p: s.p, loo: probMetrics(s.p, y, looBase), wf: walk(t) }; };
+  let cur = score(terms);
+  const designs: OddsDesign[] = [{ name: 'log age + undated flag', terms, loo: cur.loo, wf: cur.wf.pooled, lam: cur.lam, chosen: false }];
+  for (const t of ladder) {
+    const next = [...terms, t], s = score(next);
+    const b = logit(matrix(next, all), y, all, s.lam).beta[next.length - 1]!;
+    const signOk = t !== '7d growth' || b >= 0;
+    const skill = s.loo.logloss < cur.loo.logloss && s.wf.pooled.logloss < cur.wf.pooled.logloss;
+    const keep = skill && signOk;
+    designs.push({ name: `+ ${t}${keep ? '' : !skill ? ' (no held-out gain)' : ' (sign < 0, refused)'}`, terms: next, loo: s.loo, wf: s.wf.pooled, lam: s.lam, chosen: false });
+    if (keep) { terms = next; cur = s; }
+  }
+  designs.find((d) => JSON.stringify(d.terms) === JSON.stringify(terms))!.chosen = true;
+
+  const e = eb(all);
+  const X = matrix(terms, all);
+  const fit = logit(X, y, all, cur.lam);
+  const order = all.slice().sort((a, b) => cur.p[a]! - cur.p[b]! || a - b);
+  const calib = [...Array(5).keys()].map((q) => {
+    const bin = order.slice(Math.floor((q * order.length) / 5), Math.floor(((q + 1) * order.length) / 5));
+    return { pred: round(bin.reduce((a, i) => a + cur.p[i]!, 0) / bin.length, 4), obs: round(rate(bin), 4), n: bin.length };
+  });
+  const catLogit = Object.fromEntries([...new Set(cats)].sort(byStr).map((c) => [c, round(e(c, -1), 6)]));
+  return {
+    horizon_days: model.odds_horizon_days,
+    n: P.length, n_token: y.reduce((a, v) => a + v, 0),
+    terms, lam: cur.lam, m,
+    mu: fit.mu.map((v) => round(v, 6)), sd: fit.sd.map((v) => round(v, 6)), beta: fit.beta.map((v) => round(v, 6)), b0: round(fit.b0, 6),
+    cat_logit: catLogit, prior_logit: round(e('\u0000none', -1), 6),
+    loo: cur.loo, wf: cur.wf, calib, designs,
+    loo_p: Object.fromEntries(P.map((p, i) => [p.slug, round(cur.p[i]!, 4)])),
+  };
+}
+
+/** A pre-token protocol's launch odds exactly as the page recomputes them from the shipped fit. */
+export function oddsFor(o: OddsFit, p: SnapshotProtocol, age: number | null, model: ModelConstants = MODEL) {
+  const c = o.cat_logit[categoryOf(p)] ?? o.prior_logit;
+  const xa = oddsRow(o.terms, p, age, c, model);
+  const xb = oddsRow(o.terms, p, (age ?? model.unknown_age_days) + o.horizon_days, c, model);
+  if (age === null) xb[o.terms.indexOf('undated')] = 1;
+  const F = (x: number[]) => sigmoid(x.reduce((a, v, j) => a + o.beta[j]! * ((v - o.mu[j]!) / o.sd[j]!), o.b0));
+  const fa = F(xa), fb = F(xb);
+  return { xa, xb, fa: round(fa, 4), fb: round(fb, 4), p: launchOdds(fa, fb) };
+}
+
 // ---------------------------------------------------------------- farm planner
 
 /** One farm route: the category's deposit product, the base APY it pays while you wait, and its moves. */
@@ -515,9 +750,13 @@ export function horizonWeeks(age: number | null, model: ModelConstants = MODEL):
 }
 
 /** The planner's inputs for one row (data.js ships these and the page recomputes every tier from them). */
-export interface FarmInput { tvl: number; fdv: [number, number, number]; chain: string; gas_tx: number; bridge: number; apy: number; prem: number; share: number; age: number | null; weeks: number }
-/** One deposit tier's economics. */
-export interface FarmTier { deposit: number; ev: [number, number, number]; gas: number; bridge: number; carry: number; net: [number, number, number]; roi: [number, number, number]; apr: [number, number, number]; airdrop_apr: number; breakeven: number | null; verdict: 'FARM' | 'THIN' | 'SKIP'; whale: boolean }
+export interface FarmInput { tvl: number; fdv: [number, number, number]; chain: string; gas_tx: number; bridge: number; apy: number; prem: number; share: number; age: number | null; weeks: number; p: number }
+/**
+ * One deposit tier's economics, two outcomes. A (odds p): a token ships and the drop pays ev_if.
+ * B (1 - p): no token, no drop. Gas, bridge and carry are paid either way. net / roi / apr are the
+ * blended expectation (p x drop - costs); the _if fields are outcome A alone, net_none outcome B.
+ */
+export interface FarmTier { deposit: number; ev_if: [number, number, number]; ev: [number, number, number]; gas: number; bridge: number; carry: number; net_if: [number, number, number]; net_none: number; net: [number, number, number]; roi: [number, number, number]; apr: [number, number, number]; apr_if: [number, number, number]; apr_none: number; airdrop_apr: number; breakeven: number | null; verdict: 'FARM' | 'THIN' | 'SKIP'; whale: boolean }
 
 /** Carry of locked capital in %/yr after the route's base APY; at or below zero the farm holds for free. */
 export const model_carry = (route: { apy: number; prem: number }, model: ModelConstants = MODEL): number => round(model.benchmark_apy + route.prem - route.apy, 2);
@@ -526,7 +765,7 @@ export const model_carry = (route: { apy: number; prem: number }, model: ModelCo
 export interface BasketPick { slug: string; tier: FarmTier }
 /**
  * The diversified farm basket for `total` dollars: basket_n equal sleeves, filled greedily by p50 net
- * APR at the sleeve's own size among FARM rows, no two sleeves on one home chain or in one category.
+ * APR at the sleeve's own size among FARM rows, no two sleeves on one home chain, at most two per category.
  * Rows come in rank order; the page's basket() is this function line for line.
  */
 export function basket(rows: { slug: string; cat: string; f: FarmInput }[], total: number, model: ModelConstants = MODEL) {
@@ -534,11 +773,11 @@ export function basket(rows: { slug: string; cat: string; f: FarmInput }[], tota
   const cand = rows.map((r, i) => ({ r, i, t: farmTier(r.f, sleeve, model) })).filter((x) => x.t.verdict === 'FARM')
     .sort((a, b) => b.t.apr[1] - a.t.apr[1] || a.i - b.i);
   const picks: BasketPick[] = [];
-  const chains = new Set<string>(), cats = new Set<string>();
+  const chains = new Set<string>(), cats = new Map<string, number>();
   for (const x of cand) {
     if (picks.length >= model.basket_n) break;
-    if (chains.has(x.r.f.chain) || cats.has(x.r.cat)) continue;
-    chains.add(x.r.f.chain); cats.add(x.r.cat);
+    if (chains.has(x.r.f.chain) || (cats.get(x.r.cat) ?? 0) >= model.basket_cat_max) continue;
+    chains.add(x.r.f.chain); cats.set(x.r.cat, (cats.get(x.r.cat) ?? 0) + 1);
     picks.push({ slug: x.r.slug, tier: x.t });
   }
   const sum = (g: (t: FarmTier) => number) => round(picks.reduce((a, p) => a + g(p.tier), 0), 2);
@@ -549,7 +788,7 @@ export function basket(rows: { slug: string; cat: string; f: FarmInput }[], tota
   };
 }
 
-/** Deposit-sized economics; the page's farmTier() is this function line for line. */
+/** Deposit-sized two-outcome economics; the page's farmTier() is this function line for line. */
 export function farmTier(f: FarmInput, deposit: number, model: ModelConstants = MODEL): FarmTier {
   const dq = dropQuantiles();
   const prior = Math.min(f.age ?? model.prior_season_cap_days, model.prior_season_cap_days);
@@ -560,15 +799,21 @@ export function farmTier(f: FarmInput, deposit: number, model: ModelConstants = 
   const gas = round(txs * f.gas_tx, 2);
   const carryRate = ((model.benchmark_apy + f.prem - f.apy) / 100) * (days / 365);
   const carry = round(deposit * carryRate, 2);
-  const ev = [0, 1, 2].map((q) => round(deposit * perDollar(q), 2)) as [number, number, number];
-  const net = ev.map((e) => round(e - gas - f.bridge - carry, 2)) as [number, number, number];
+  const cost = gas + f.bridge + carry;
+  const ann = (n: number) => round((((100 * n) / deposit) * 365) / days, 2);
+  const ev_if = [0, 1, 2].map((q) => round(deposit * perDollar(q), 2)) as [number, number, number];
+  const ev = ev_if.map((e) => round(f.p * e, 2)) as [number, number, number];
+  const net_if = ev_if.map((e) => round(e - cost, 2)) as [number, number, number];
+  const net_none = round(-cost, 2);
+  const net = ev.map((e) => round(e - cost, 2)) as [number, number, number];
   const roi = net.map((n) => round((100 * n) / deposit, 2)) as [number, number, number];
-  const edge = perDollar(1) - carryRate;
   const apr = roi.map((r) => round((r * 365) / days, 2)) as [number, number, number];
+  const edge = f.p * perDollar(1) - carryRate;
   const verdict = apr[1] >= model.farm_apr && apr[0] >= model.farm_p25_apr ? 'FARM' : apr[1] > 0 ? 'THIN' : 'SKIP';
   return {
-    deposit, ev, gas, bridge: f.bridge, carry, net, roi, apr,
-    airdrop_apr: round(100 * perDollar(1) * (365 / days), 2),
+    deposit, ev_if, ev, gas, bridge: f.bridge, carry, net_if, net_none, net, roi, apr,
+    apr_if: net_if.map(ann) as [number, number, number], apr_none: ann(net_none),
+    airdrop_apr: round(100 * f.p * perDollar(1) * (365 / days), 2),
     breakeven: edge > 0 ? Math.ceil((gas + f.bridge) / edge) : null,
     verdict, whale: deposit > model.whale_tvl_share * f.tvl,
   };
@@ -597,7 +842,7 @@ export function productScreen(p: SnapshotProtocol): string | null {
 
 // ---------------------------------------------------------------- farm plan text
 
-const usd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFractionDigits: n < 10 ? 2 : 0 })}`;
+const usd = (n: number): string => `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: Math.abs(n) < 10 ? 2 : 0 })}`;
 const pct = (n: number): string => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 
 /** A farm step: what to do, what it costs, how long it takes. */
@@ -612,9 +857,10 @@ export function farmSteps(p: SnapshotProtocol, f: FarmInput, route: Route, tiers
     ? 'Withdraw USDC from an exchange straight to Ethereum mainnet (no bridge needed)'
     : `Withdraw USDC to Ethereum or an exchange that supports ${f.chain}, then move it to ${f.chain} with the chain's canonical or a major intent bridge`;
   const freeCarry = model_carry(route) <= 0;
+  const odds = `${Math.round(100 * f.p)}%`;
   const size = best === null
-    ? `No tier clears the FARM bar: even at ${usd(t50.deposit)} the p50 return is ${pct(t50.roi[1])} over ${f.weeks} weeks (${pct(t50.apr[1])} a year), so use this plan only for stables you would park in ${p.name} anyway`
-    : `Size it at ${usd(best.deposit)} or more: ${best.verdict} there, netting ${pct(best.roi[1])} at p50 over the ${f.weeks}-week window (${pct(best.apr[1])} a year; p25 ${pct(best.roi[0])}, p75 ${pct(best.roi[2])}) after every cost${best.verdict === 'THIN' && freeCarry ? `. Zero-carry free option: the ${route.apy}% base yield covers benchmark and risk premium, so the drop is upside on stables held anyway` : ''}`;
+    ? `No tier clears the FARM bar: at ${odds} launch odds even ${usd(t50.deposit)} expects ${pct(t50.apr[1])} a year at p50 (${pct(t50.apr_if[1])} if a token ships), so use this plan only for stables you would park in ${p.name} anyway`
+    : `Size it at ${usd(best.deposit)} or more: ${best.verdict} there blended over both outcomes, ${pct(best.apr[1])} a year at p50 (p25 ${pct(best.apr[0])}, p75 ${pct(best.apr[2])}) after every cost, at ${odds} odds of a token within 12 months${best.verdict === 'THIN' && freeCarry ? `. Zero carry: the ${route.apy}% base yield covers benchmark + premium, so no token costs only gas` : ''}`;
   const tranche = g !== null && g >= 15
     ? `TVL jumped ${g.toFixed(1)}% in 7 days: put in half now and the rest only if TVL holds for two more weeks (a hot week can be an incentive campaign that ends)`
     : g !== null && g <= -15
@@ -625,7 +871,7 @@ export function farmSteps(p: SnapshotProtocol, f: FarmInput, route: Route, tiers
     { action: `On ${p.name} (${f.chain}), ${route.open}. This is the ${route.product}; its base yield of about ${route.apy}% a year is what offsets the carry of locked capital.`, cost: `${usd(round(f.gas_tx * 2, 2))} gas (approve + deposit)`, time: '10 minutes' },
     { action: `Over the ${f.weeks}-week window to the assumed token event, ${route.keep}. Every action comes from the same wallet so the address reads as a repeat user.`, cost: `${usd(round(f.gas_tx * Math.ceil(f.weeks / MODEL.tx_per_weeks), 2))} gas for ${Math.ceil(f.weeks / MODEL.tx_per_weeks)} actions`, time: `10 minutes a month for ${f.weeks} weeks` },
     { action: `${tranche}.`, cost: "free on the protocol's own stats page", time: '5 minutes a week' },
-    { action: `Expect, at p50, ${usd(t1.ev[1])} of airdrop on ${usd(t1.deposit)}, ${usd(t10.ev[1])} on ${usd(t10.deposit)} and ${usd(t50.ev[1])} on ${usd(t50.deposit)} (an airdrop yield of ${t10.airdrop_apr}% a year on top of the ${route.apy}% base). Net of gas, bridge and carry that is ${pct(t1.roi[1])} / ${pct(t10.roi[1])} / ${pct(t50.roi[1])} over the window: ${t1.verdict} / ${t10.verdict} / ${t50.verdict}; break-even deposit ${t10.breakeven === null ? 'none' : usd(t10.breakeven)}.`, cost: `carry ${usd(t10.carry)} at ${usd(t10.deposit)} (${MODEL.benchmark_apy}% benchmark + ${route.prem}% risk premium - ${route.apy}% base APY)`, time: `${f.weeks} weeks` },
+    { action: `Two outcomes at p50. Token ships (${odds}): a drop of ${usd(t1.ev_if[1])} on ${usd(t1.deposit)}, ${usd(t10.ev_if[1])} on ${usd(t10.deposit)}, ${usd(t50.ev_if[1])} on ${usd(t50.deposit)}, ${pct(t10.apr_if[1])} a year at ${usd(t10.deposit)}. No token (${100 - Math.round(100 * f.p)}%): no drop, ${usd(t10.net_none)} at ${usd(t10.deposit)}. Blended: ${pct(t1.apr[1])} / ${pct(t10.apr[1])} / ${pct(t50.apr[1])} a year, ${t1.verdict} / ${t10.verdict} / ${t50.verdict}; break-even ${t10.breakeven === null ? 'none' : usd(t10.breakeven)}.`, cost: `carry ${usd(t10.carry)} at ${usd(t10.deposit)} (${MODEL.benchmark_apy}% benchmark + ${route.prem}% risk premium - ${route.apy}% base APY)`, time: `${f.weeks} weeks` },
     { action: `Bookmark ${p.name}'s points or rewards page from its own docs, never from a DM or an ad, and claim only through its official claimer; a page that asks for a seed phrase is a scam.`, cost: 'nothing: a real claim never charges a deposit', time: '10 minutes when a claim opens' },
     { action: `When the window closes or a token ships, ${route.exit} on ${f.chain}. Main risk: ${route.risk}; size this as capital you can lose, since a pre-token protocol can fail outright.`, cost: `${usd(round(f.gas_tx * 2, 2))} gas to unwind`, time: '20 minutes' },
   ];
@@ -655,6 +901,10 @@ export interface BoardRow {
   implied_low_usd: number;
   implied_high_usd: number;
   fdv_to_tvl: number;
+  p_token_12m: number;
+  risk_adj_value_usd: number;
+  net_apr_p50_pct_by_deposit: Record<string, number>;
+  net_apr_if_token_p50_pct_by_deposit: Record<string, number>;
   verdict_by_deposit: Record<string, 'FARM' | 'THIN' | 'SKIP'>;
   net_roi_p50_pct_by_deposit: Record<string, number>;
   farm_steps: string[];
@@ -672,23 +922,31 @@ function anchorsFor(p: SnapshotProtocol, comps: SnapshotProtocol[], n: number) {
 /** The board and the dashboard's data, built from one snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
   const { fit, comps, design } = fitModel(snapshot, model);
+  const odds = fitOdds(snapshot, model);
   const watch = new Set(snapshot.watchlist);
   const funnel = { total: snapshot.protocols.length, comps: comps.length, token_other: 0, watchlist: 0, emerging: 0, aside_above: 0, screened_below: 0 };
   const aside: { name: string; category: string; tvl: number; reason: string }[] = [];
+  const all: { s: string; n: string; c: string; t: number; d: string; why: string; pt: number }[] = [];
   const chosen: SnapshotProtocol[] = [];
   const compSet = new Set(comps.map((c) => c.slug));
+  const mark = (p: SnapshotProtocol, d: string, why: string) => all.push({ s: p.slug, n: p.name, c: categoryOf(p), t: p.tvl_usd, d, why, pt: odds.loo_p[p.slug]! });
   for (const p of snapshot.protocols) {
-    if (watch.has(p.slug)) { chosen.push(p); funnel.watchlist++; continue; }
-    if (compSet.has(p.slug)) continue;
-    if (!isPreToken(p)) { funnel.token_other++; continue; }
+    if (watch.has(p.slug)) { chosen.push(p); funnel.watchlist++; mark(p, 'W', 'on the house watchlist: ranked'); continue; }
+    if (compSet.has(p.slug)) { mark(p, 'C', `token trades (mcap ${usd(Math.round(p.mcap_usd! / 1e6))}M): a value comp, never ranked`); continue; }
+    if (!isPreToken(p)) {
+      funnel.token_other++;
+      mark(p, 'K', p.mcap_usd === null ? 'token recorded (gecko id or symbol), no market cap: launch-odds evidence only' : `token trades under the ${usd(model.comp_min_usd / 1e6)}M comp floor: launch-odds evidence only`);
+      continue;
+    }
     const screen = productScreen(p);
     if (p.tvl_usd >= snapshot.floor_usd) {
       funnel.aside_above++;
-      aside.push({ name: p.name, category: categoryOf(p), tvl: p.tvl_usd, reason: screen ?? 'above the floor but off the house list: DefiLlama records a parent protocol (a field the snapshot does not carry)' });
+      const why = screen ?? 'above the floor but off the house list: DefiLlama records a parent protocol (a field the snapshot does not carry)';
+      aside.push({ name: p.name, category: categoryOf(p), tvl: p.tvl_usd, reason: why }); mark(p, 'A', why);
     } else if (screen !== null) {
       funnel.screened_below++;
-      aside.push({ name: p.name, category: categoryOf(p), tvl: p.tvl_usd, reason: screen });
-    } else { chosen.push(p); funnel.emerging++; }
+      aside.push({ name: p.name, category: categoryOf(p), tvl: p.tvl_usd, reason: screen }); mark(p, 'X', screen);
+    } else { chosen.push(p); funnel.emerging++; mark(p, 'E', 'pre-token below the floor, passes every product screen: ranked'); }
   }
   const band = fit.resid_q;
   const scored = chosen.map((p) => {
@@ -700,9 +958,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
     const hi = Math.max(1, Math.round(fdv * Math.exp(band.q75)));
     const route = routeOf(categoryOf(p));
     const chain = p.chains[0] ?? 'Ethereum';
-    const f: FarmInput = { tvl: p.tvl_usd, fdv: [lo, fdv, hi], chain, gas_tx: GAS_USD[chain] ?? model.gas_default_usd, bridge: chain === 'Ethereum' ? 0 : model.bridge_usd, apy: route.apy, prem: route.prem, share: route.share, age, weeks: horizonWeeks(age, model) };
+    const od = oddsFor(odds, p, age, model);
+    const f: FarmInput = { tvl: p.tvl_usd, fdv: [lo, fdv, hi], chain, gas_tx: GAS_USD[chain] ?? model.gas_default_usd, bridge: chain === 'Ethereum' ? 0 : model.bridge_usd, apy: route.apy, prem: route.prem, share: route.share, age, weeks: horizonWeeks(age, model), p: od.p };
     const tiers = model.tiers.map((d) => farmTier(f, d, model));
-    return { p, age, x, lg, fdv, lo, hi, route, f, tiers, steps: farmSteps(p, f, route, tiers) };
+    return { p, age, x, lg, fdv, lo, hi, route, f, od, tiers, steps: farmSteps(p, f, route, tiers) };
   }).sort((a, b) => b.fdv - a.fdv || byStr(a.p.slug, b.p.slug));
 
   const board: BoardRow[] = scored.map((s, i) => ({
@@ -721,7 +980,11 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
     implied_low_usd: s.lo,
     implied_high_usd: s.hi,
     fdv_to_tvl: round(s.fdv / s.p.tvl_usd, 4),
+    p_token_12m: s.f.p,
+    risk_adj_value_usd: Math.max(1, Math.round(s.fdv * s.f.p)),
     verdict_by_deposit: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), t.verdict])),
+    net_apr_p50_pct_by_deposit: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), t.apr[1]])),
+    net_apr_if_token_p50_pct_by_deposit: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), t.apr_if[1]])),
     net_roi_p50_pct_by_deposit: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), t.roi[1]])),
     farm_steps: s.steps.map(stepText),
   }));
@@ -736,6 +999,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
     drops: REF_DROPS,
     drop_q: dropQuantiles(),
     fit,
+    odds: { ...odds, loo_p: undefined },
     funnel,
     verdicts: Object.fromEntries(model.tiers.map((d) => [String(d), { FARM: count(d, 'FARM'), THIN: count(d, 'THIN'), SKIP: count(d, 'SKIP') }])),
     baskets: Object.fromEntries(model.tiers.map((d) => [String(d), basket(scored.map((s) => ({ slug: s.p.slug, cat: categoryOf(s.p), f: s.f })), d, model)])),
@@ -755,11 +1019,14 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
       hi: s.hi,
       route: s.route,
       f: s.f,
+      od: s.od,
+      b: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), [t.verdict, t.apr[1]]])),
       anchors: anchorsFor(s.p, comps, 3),
       steps: s.steps,
     })),
     comps: comps.map((c) => ({ name: c.name, cat: categoryOf(c), tvl: c.tvl_usd, mcap: c.mcap_usd! })),
     aside: aside.sort((a, b) => b.tvl - a.tvl || byStr(a.name, b.name)),
+    all: all.sort((a, b) => b.t - a.t || byStr(a.s, b.s)),
   };
   return { board, radar };
 }

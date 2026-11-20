@@ -3,7 +3,7 @@
 import { readFileSync, readdirSync, lstatSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildDossier } from '../vendor/makefun-board.ts';
-import { basket } from '../lib/model.ts';
+import { basket, MODEL } from '../lib/model.ts';
 
 const [, , snapshotPath, outDir, outDir2] = process.argv;
 const fail = [];
@@ -138,10 +138,25 @@ const tier = (f, deposit) => {
   const per = (q) => ((dq[q] / 100) * f.share * f.fdv[q] * ts) / f.tvl;
   const gas = rnd((MD.tx_base + Math.ceil(f.weeks / MD.tx_per_weeks)) * f.gas_tx, 2);
   const carry = rnd(deposit * ((MD.benchmark_apy + f.prem - f.apy) / 100) * (days / 365), 2);
-  const roi = [0, 1, 2].map((q) => rnd((100 * rnd(rnd(deposit * per(q), 2) - gas - f.bridge - carry, 2)) / deposit, 2));
+  const cost = gas + f.bridge + carry;
+  const evIf = [0, 1, 2].map((q) => rnd(deposit * per(q), 2));
+  const net = evIf.map((e) => rnd(rnd(f.p * e, 2) - cost, 2));
+  const roi = net.map((n) => rnd((100 * n) / deposit, 2));
   const apr = roi.map((x) => rnd((x * 365) / days, 2));
-  return { roi, verdict: apr[1] >= MD.farm_apr && apr[0] >= MD.farm_p25_apr ? 'FARM' : apr[1] > 0 ? 'THIN' : 'SKIP' };
+  const aprIf = evIf.map((e) => rnd((((100 * rnd(e - cost, 2)) / deposit) * 365) / days, 2));
+  return { net, roi, apr, aprIf, verdict: apr[1] >= MD.farm_apr && apr[0] >= MD.farm_p25_apr ? 'FARM' : apr[1] > 0 ? 'THIN' : 'SKIP' };
 };
+// Launch odds rebuilt from the snapshot's own fields and the shipped logistic: P = (F(a+H) - F(a)) / (1 - F(a)).
+const OD = data.odds, snapBy = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+const ageOf = (p) => (p.listed_at === null ? null : Math.max(0, Math.round((Date.parse(`${snapshot.as_of}T00:00:00Z`) - Date.parse(`${p.listed_at}T00:00:00Z`)) / 86400000)));
+const oddsOf = (p) => {
+  const age = ageOf(p), u = age === null ? 1 : 0, a = age ?? MD.unknown_age_days, cat = p.category ?? 'Uncategorized';
+  const col = (t, aa) => ({ 'log age': rnd(Math.log((aa + MD.odds_age_pad_days) / 365), 6), undated: u, 'category rate': rnd(OD.cat_logit[cat] ?? OD.prior_logit, 6), 'log TVL': rnd(Math.log(p.tvl_usd), 4), 'log chains': rnd(Math.log(Math.max(1, p.chains.length)), 4), '7d growth': clampv(p.change_7d ?? 0, -MD.growth_cap_pct, MD.growth_cap_pct) / 100 })[t];
+  const Fx = (aa) => 1 / (1 + Math.exp(-OD.terms.map((t) => col(t, aa)).reduce((s, v, j) => s + OD.beta[j] * ((v - OD.mu[j]) / OD.sd[j]), OD.b0)));
+  const fa = Fx(a), fb = Fx(a + OD.horizon_days);
+  return rnd(clampv((fb - fa) / Math.max(1e-9, 1 - fa), 0, 1), 4);
+};
+let oddsBad = 0, oddsRange = 0, evBad = 0, aprBad = 0;
 for (const d of data.rows) {
   const b = bySlug.get(d.slug);
   if (!b) { implBad++; continue; }
@@ -150,13 +165,26 @@ for (const d of data.rows) {
   const sea = Math.log(1 - F.d * Math.exp(-(d.age ?? MD.unknown_age_days) / F.T));
   if (Math.max(1, Math.round(Math.exp(base + g + sea))) !== b.implied_value_usd || d.fdv !== b.implied_value_usd) implBad++;
   if ((d.chg ?? 0) < 0 && g >= 0) monoBad++;
-  for (const dep of MD.tiers) { const t = tier(d.f, dep); if (t.verdict !== b.verdict_by_deposit[dep] || t.roi[1] !== b.net_roi_p50_pct_by_deposit[dep]) tierBad++; }
+  const pt = oddsOf(snapBy.get(d.slug));
+  if (pt !== b.p_token_12m || pt !== d.f.p) oddsBad++;
+  if (!(pt > 0 && pt < 1)) oddsRange++;
+  if (b.risk_adj_value_usd !== Math.max(1, Math.round(b.implied_value_usd * pt))) evBad++;
+  for (const dep of MD.tiers) {
+    const t = tier(d.f, dep);
+    if (t.verdict !== b.verdict_by_deposit[dep] || t.roi[1] !== b.net_roi_p50_pct_by_deposit[dep] || t.apr[1] !== b.net_apr_p50_pct_by_deposit[dep] || t.verdict !== d.b[dep][0] || t.apr[1] !== d.b[dep][1]) tierBad++;
+    if (t.aprIf[1] !== b.net_apr_if_token_p50_pct_by_deposit[dep] || t.apr[1] > t.aprIf[1] + 1e-9) aprBad++;
+  }
   const rebuilt = d.steps.map((s) => `${s.action} Cost: ${s.cost}. Time: ${s.time}.`).map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s));
   if (JSON.stringify(rebuilt) !== JSON.stringify(b.farm_steps)) stepBad++;
 }
 ok('cross: data.js rows = board rows', data.rows.length === rows.length, String(data.rows.length));
 ok('cross: implied FDV recomputes from shipped coefficients for every row', implBad === 0, `${implBad} mismatches`);
-ok('cross: farm verdict and p50 ROI recompute for every row and tier', tierBad === 0, `${tierBad} mismatches`);
+ok('cross: two-outcome verdict, p50 ROI and risk-adj APR recompute for every row at all 3 tiers', tierBad === 0, `${rows.length * MD.tiers.length - tierBad}/${rows.length * MD.tiers.length} match`);
+ok('cross: if-token APR recomputes and is never below the blended APR', aprBad === 0, `${aprBad} mismatches`);
+ok('cross: P(token) rebuilt from snapshot fields + shipped logistic for every row', oddsBad === 0, `${rows.length - oddsBad}/${rows.length} match`);
+ok('cross: every P(token) strictly inside (0, 1)', oddsRange === 0, `range ${Math.min(...rows.map((r) => r.p_token_12m))}..${Math.max(...rows.map((r) => r.p_token_12m))}`);
+ok('cross: risk-adj value = implied FDV x P(token) for every row', evBad === 0, `${evBad} mismatches`);
+ok('cross: odds model validated blind (LOO AUC > 0.5, Brier beats base rate, walk-forward AUC > 0.5)', OD.loo.auc > 0.5 && OD.loo.brier < OD.loo.base_brier && OD.wf.pooled.auc > 0.5, `LOO AUC ${OD.loo.auc} Brier ${OD.loo.brier} vs ${OD.loo.base_brier}; WF AUC ${OD.wf.pooled.auc}`);
 ok('cross: farm steps rebuild board.json steps', stepBad === 0, `${stepBad} mismatches`);
 ok('cross: record terms sign-constrained (k > 0, d > 0) and a falling TVL never raises a value', F.k > 0 && F.d > 0 && monoBad === 0);
 ok('cross: log TVL elasticity non-negative', F.elasticity >= 0, String(F.elasticity));
@@ -164,20 +192,37 @@ ok('cross: verdict counts match board per tier', MD.tiers.every((dep) => ['FARM'
 ok('cross: watchlist rows all present in data.js', data.rows.filter((d) => d.seg === 'W').length === snapshot.watchlist.length);
 const fn = data.funnel;
 ok('cross: the funnel adds up to every protocol', fn.comps + fn.token_other + fn.watchlist + fn.emerging + fn.aside_above + fn.screened_below === fn.total && fn.total === snapshot.protocols.length);
+{
+  const A = data.all, dc = (k) => A.filter((a) => a.d === k).map((a) => a.s).sort();
+  const once = A.length === snapshot.protocols.length && new Set(A.map((a) => a.s)).size === A.length && A.every((a) => slugs.has(a.s));
+  const comp = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd >= MODEL.comp_min_usd && p.tvl_usd >= MODEL.comp_min_usd).map((p) => p.slug).sort();
+  const ranked = [...dc('W'), ...dc('E')].sort(), boardSl = rows.map((r) => r.slug).sort();
+  const tokenK = dc('K').every((s) => { const p = snapBy.get(s); return p.gecko_id !== null || p.symbol !== null || p.mcap_usd !== null; });
+  const asideOk = [...dc('A'), ...dc('X')].every((s) => { const p = snapBy.get(s); return p.mcap_usd === null && p.gecko_id === null && p.symbol === null; });
+  const counts = { W: fn.watchlist, E: fn.emerging, C: fn.comps, K: fn.token_other, A: fn.aside_above, X: fn.screened_below };
+  ok('accounting: 758/758, every snapshot protocol in exactly one disposition with a reason', once && A.every((a) => a.why.length >= 20), `${A.length}/${snapshot.protocols.length}`);
+  ok('accounting: disposition counts = funnel', Object.entries(counts).every(([k, n]) => dc(k).length === n), Object.entries(counts).map(([k, n]) => `${k}${n}`).join(' '));
+  ok('accounting: W = watchlist, W+E = board rows, C = comps, K tokened, A/X untokened', JSON.stringify(dc('W')) === JSON.stringify([...snapshot.watchlist].sort()) && JSON.stringify(ranked) === JSON.stringify(boardSl) && JSON.stringify(dc('C')) === JSON.stringify(comp) && tokenK && asideOk);
+  ok('accounting: held-out token probability in (0, 1) for all 758', A.every((a) => a.pt > 0 && a.pt < 1));
+}
 ok('cross: traded comps never on the board', data.comps.every((c) => !rows.some((r) => r.name === c.name && snapshot.protocols.find((p) => p.slug === r.slug).mcap_usd !== null)));
 ok('cross: every board row records no token', rows.every((r) => { const p = snapshot.protocols.find((x) => x.slug === r.slug); return p.mcap_usd === null && p.gecko_id === null && p.symbol === null; }));
 ok('cross: bands bracket the mid', rows.every((r) => r.implied_low_usd <= r.implied_value_usd && r.implied_value_usd <= r.implied_high_usd));
 ok('cross: model beats median-multiple baselines on LOO R2', F.loo.r2 > 0 && F.baselines.slice(1).every((b) => F.loo.r2 > b.metrics.r2), `LOO ${F.loo.r2}`);
 let bkBad = 0;
+const bkInfo = [];
 for (const dep of MD.tiers) {
   const b = basket(data.rows.map((r) => ({ slug: r.slug, cat: r.cat, f: r.f })), dep, MD), s = data.baskets[dep];
   const picks = s.slugs.map((x) => data.rows.find((r) => r.slug === x));
   const sleeveOk = picks.every((r) => tier(r.f, dep / MD.basket_n).verdict === 'FARM');
-  const distinct = new Set(picks.map((r) => r.f.chain)).size === picks.length && new Set(picks.map((r) => r.cat)).size === picks.length;
-  if (JSON.stringify(b) !== JSON.stringify(s) || !sleeveOk || !distinct || picks.length !== MD.basket_n) bkBad++;
+  const perCat = picks.reduce((a, r) => ((a[r.cat] = (a[r.cat] || 0) + 1), a), {});
+  const distinct = new Set(picks.map((r) => r.f.chain)).size === picks.length && Object.values(perCat).every((n) => n <= MD.basket_cat_max);
+  const sum = rnd(picks.reduce((a, r) => a + tier(r.f, dep / MD.basket_n).net[1], 0), 2);
+  if (JSON.stringify(b) !== JSON.stringify(s) || !sleeveOk || !distinct || picks.length > MD.basket_n || (dep >= 10000 && picks.length !== MD.basket_n) || sum !== s.net_p50) bkBad++;
+  bkInfo.push(`${dep}:${picks.length}`);
 }
-ok('cross: farm basket per tier rebuilds, 4 FARM sleeves on distinct chains and categories', bkBad === 0, `${bkBad} bad tiers`);
-ok('cross: dashboard source under 64,000 bytes', totalBytes < 64000, `${totalBytes} bytes`);
+ok('cross: farm basket per tier rebuilds (sleeve math summed independently); FARM sleeves, distinct home chains, <= 2 per category, 4 sleeves at $10k and $50k', bkBad === 0, bkInfo.join(' '));
+ok('cross: dashboard source <= 63,500 bytes', totalBytes <= 63500, `${totalBytes} bytes`);
 
 // ---------------------------------------------------------------- determinism (optional second run)
 if (outDir2) {
