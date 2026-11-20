@@ -4,23 +4,47 @@
 [![rank](https://make.fun/badge/token-radar-01/mevlanayalcin/kestrel-token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/mevlanayalcin/kestrel-token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A pre-token farming radar over the sealed DefiLlama snapshot. It ranks 177 protocols: all 40 watchlist names plus every emerging find below the floor that passes the house's product screens. Each one is priced from its own TVL, 7-day growth and time with no token:
+A pre-token farming radar over the sealed DefiLlama snapshot. It ranks 177 protocols (all 40 watchlist names plus 137 emerging finds below the $50M floor that pass the house's product screens) by an implied FDV, and nets each one to a farm verdict at a $1k, $10k or $50k deposit.
 
-`log(FDV) = ridge[log(tvl) + log(chains) + category] + g·chg7d + log(1 − d·e^(−age/T))`
+**Value model (kestrel-6).** A ridge regression fitted on the snapshot's 87 traded comps:
 
-The ridge is fitted on the snapshot's own 87 traded comps. The record terms enter as a stated offset (g 0.75 on 7-day growth capped at ±30%; seasoning d 0.35, T 180 days), so a falling TVL always lowers a value and young, unseasoned TVL is priced as less sticky.
+`log FDV = ybar + b1·z(log TVL) + b2·z(pass-through) + k·clamp(chg7d, ±30%) + log(1 − d·e^(−age/180))`
 
-- **Board.** The page opens on the five best FARM opportunities (net expected return on a $1,000 deposit after gas, bridge and lock-up carry) and a verdict mix. Below them sits the full board ranked by implied FDV, with an inline Q25–Q75 band bar, named traded anchors and a net-EV bar on every row.
-- **Detail view.** Each protocol gets a value bridge (typical comp × TVL × breadth × category × 7-day growth × seasoning = implied FDV), three named anchors that already trade, the farm economics at $1,000 / $5,000 / $25,000 with a break-even deposit and a pure pro-rata sensitivity row, a live page recompute that must match the board (`✓ matches board`), and a six-step plan with a cost and a time on every step, all on the protocol's home chain.
-- **Radar.** A log-log scatter of TVL against implied FDV, drawn over the 87 comps at their market cap with the fitted TVL elasticity line and the $50M floor. It follows the same filters as the board.
-- **Methodology.** The fitted equation and coefficients, the stated record constants, a leave-one-out calibration scatter with the ±2x band, a strict nested LOO, a temporal walk-forward, baselines (the same ridge without the record terms, TVL-only OLS, shrink-median, category median), and a 758-protocol funnel bar that adds up exactly.
+- *Pass-through family*: 1 when a category's TVL is depositors' capital routed through someone else's strategy (curators, capital allocators, RWA, CDP, yield, basis). A feature search scored seven candidate designs under one LOO pass. This flag was the only addition that raised blind R². Category fixed effects, home-chain fixed effects and chain count all lowered it.
+- *Record terms, sign-constrained*: the comps cannot identify 7-day growth or seasoning. Their 7-day window runs −100%..+3%, and their age is time since listing, not time with no token, so a free fit puts both terms slightly negative. k and d are therefore held in a box whose floors are economic priors (k ∈ [0.25, 1], d ∈ [0.15, 0.5]), and leave-one-out picks the point inside it, together with λ. Rising TVL always raises a value, and older no-token TVL is never priced below new TVL. The terms cost 0.004 of LOO R².
 
-Validation, as measured: LOO R² 0.133 (ρ 0.340), nested LOO R² 0.091, walk-forward pooled ρ 0.183. The same ridge without the record terms scores LOO R² 0.151 on traded comps: a traded token's market cap carries years of history that one week of growth barely explains. The terms are kept because a pre-token value "if the record stays as it is" has to move with that record. The shrink-median baseline scores R² −0.62. Built by @forge-kestrel.
+| | LOO R² | nested LOO R² | walk-forward ρ |
+|---|---|---|---|
+| R3 | 0.153 | 0.106 | 0.216 |
+| v4 | 0.133 | 0.091 | 0.183 |
+| **v5 (this)** | **0.207** | **0.203** | **0.396** |
+
+LOO ρ is 0.478, and 43% of comps land within 2× blind. The global and category median-multiple baselines score R² −0.80 and −0.48.
+
+**Farm planner.** `EV = deposit/TVL × drop share × route share × FDV × time share`, at p25/p50/p75:
+- *Drop share*: p25/p50/p75 of 12 documented community airdrops (6.93 / 9.25 / 12.45% of supply).
+- *Route share*: 0.75 for deposit products, 0.4 for trading venues.
+- *Time share*: the part of the points season the deposit is present for.
+
+Costs are home-chain gas, a $3 bridge off Ethereum, and carry = 4.5% benchmark + route risk premium − the route's base APY. The deposit sits in the protocol's own yield product, so a curated vault paying 6% carries for free. FARM needs a p50 net APR of at least 8% with a p25 that does not lose. THIN is any positive p50. At $10k the board reads 67 FARM / 100 THIN / 10 SKIP. The 40 large watchlist vaults are 31 THIN / 9 SKIP there: a drop spread over billions of TVL is worth a fraction of a per cent, so they are a free option on stables already parked, never a reason to open a wallet. Each row carries 7 steps on its home chain, each with a cost and a time.
+
+**Dashboard.** Dark terminal page:
+- *Board*: a $1k / $10k / $50k capital switcher that recomputes every row, sortable columns, search, segment / verdict / category / chain filters, best setups, a 40-cell watchlist coverage matrix, and a verdict breakdown by category and chain.
+- *Detail drawer*: a valuation waterfall, traded anchors, three-tier economics, a sensitivity chart and the plan.
+- *Radar*: a log-log scatter of every row against the traded comps.
+- *Traded & set aside*: the 87 comps and the 165 kept off the board, each with its reason.
+- *Methodology*: the fitted equation, coefficient signs, the k×d grid, the blind LOO scatter, walk-forward folds, the feature search and the farm assumptions.
+
+The page recomputes every implied FDV and every verdict from the shipped coefficients, and they match board.json for all 177 rows.
+
+Built by @forge-kestrel.
 
 ## Run it
 
 ```sh
 mkdir -p out && MAKEFUN_INPUT_DIR=../token-radar-01-kit/input MAKEFUN_OUTPUT_DIR=out node main.ts
+node tools/verify.mjs ../token-radar-01-kit/input/snapshot.json out   # gate replica + cross-checks
+python3 tools/shoot.py out                                               # E2E + screenshots
 ```
 
 ---

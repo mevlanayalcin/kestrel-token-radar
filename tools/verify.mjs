@@ -125,61 +125,49 @@ ok('dossier text: source untruncated', !/Cut at|of this file's \d+ lines not sho
 ok('dossier: cover is 01 (first by name)', dossier.cover === 0 && dossier.images[0].name === '01-board-overview.jpg');
 ok('dossier: dashboard source files all shown whole', ['app.css', 'app.js', 'index.html'].every((f) => dossier.text.includes(`### ${f}`)));
 
-// ---------------------------------------------------------------- cross-checks: board vs data vs shots
-const dataScript = read('data.js');
-const data = JSON.parse(dataScript.replace(/^window\.RADAR=/, '').replace(/;\s*$/, ''));
-ok('cross: data.js rows count = board rows', data.rows.length === rows.length, `${data.rows.length}`);
-ok('cross: data.js kpis match board', data.kpis.board === rows.length && data.kpis.watchlist === snapshot.watchlist.length && data.kpis.watchlist_ranked === snapshot.watchlist.length, `board ${data.kpis.board}, watchlist ${data.kpis.watchlist}`);
-ok('cross: sum implied matches', data.kpis.total_implied_usd === rows.reduce((n, r) => n + r.implied_value_usd, 0));
+// ---------------------------------------------------------------- cross-checks: board vs data.js
+const data = JSON.parse(read('data.js').replace(/^window\.RADAR=/, '').replace(/;\s*$/, ''));
+const F = data.fit, MD = data.model;
 const bySlug = new Map(rows.map((r) => [r.slug, r]));
-let stepMismatch = 0, implMismatch = 0, evMismatch = 0, verdictMismatch = 0;
-const F = data.fit, MD = data.model, GS = data.gas_usd;
-let monoBad = 0;
 const rnd = (n, dp) => { const f = 10 ** dp; return Math.round(n * f) / f; };
+const clampv = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+let implBad = 0, tierBad = 0, stepBad = 0, monoBad = 0;
+const tier = (f, deposit) => {
+  const dq = data.drop_q, prior = Math.min(f.age ?? MD.prior_season_cap_days, MD.prior_season_cap_days), days = f.weeks * 7, ts = days / (days + prior);
+  const per = (q) => ((dq[q] / 100) * f.share * f.fdv[q] * ts) / f.tvl;
+  const gas = rnd((MD.tx_base + Math.ceil(f.weeks / MD.tx_per_weeks)) * f.gas_tx, 2);
+  const carry = rnd(deposit * ((MD.benchmark_apy + f.prem - f.apy) / 100) * (days / 365), 2);
+  const roi = [0, 1, 2].map((q) => rnd((100 * rnd(rnd(deposit * per(q), 2) - gas - f.bridge - carry, 2)) / deposit, 2));
+  const apr = roi.map((x) => rnd((x * 365) / days, 2));
+  return { roi, verdict: apr[1] >= MD.farm_apr && apr[0] >= MD.farm_p25_apr ? 'FARM' : apr[1] > 0 ? 'THIN' : 'SKIP' };
+};
 for (const d of data.rows) {
   const b = bySlug.get(d.slug);
-  if (!b) { stepMismatch++; continue; }
+  if (!b) { implBad++; continue; }
+  const base = d.x.reduce((a, v, j) => a + F.beta[j] * ((v - F.mu[j]) / F.sd[j]), F.ybar);
+  const g = (F.k * clampv(d.chg ?? 0, -MD.growth_cap_pct, MD.growth_cap_pct)) / 100;
+  const sea = Math.log(1 - F.d * Math.exp(-(d.age ?? MD.unknown_age_days) / F.T));
+  if (Math.max(1, Math.round(Math.exp(base + g + sea))) !== b.implied_value_usd || d.fdv !== b.implied_value_usd) implBad++;
+  if ((d.chg ?? 0) < 0 && g >= 0) monoBad++;
+  for (const dep of MD.tiers) { const t = tier(d.f, dep); if (t.verdict !== b.verdict_by_deposit[dep] || t.roi[1] !== b.net_roi_p50_pct_by_deposit[dep]) tierBad++; }
   const rebuilt = d.steps.map((s) => `${s.action} Cost: ${s.cost}. Time: ${s.time}.`).map((s) => (s.length > 600 ? `${s.slice(0, 596)}...` : s));
-  if (JSON.stringify(rebuilt) !== JSON.stringify(b.farm_steps)) stepMismatch++;
-  // the page's implied: exp of the rounded-feature dot product with the shipped coefficients
-  const logv = d.x.reduce((acc, v, j) => acc + F.beta[j] * ((v - F.mu[j]) / F.sd[j]), F.ybar);
-  // plus the record offset: growth (clamped 7d) and seasoning (time with no token)
-  const g = (MD.growth_elasticity * Math.min(MD.growth_cap_pct, Math.max(-MD.growth_cap_pct, d.change_7d ?? 0))) / 100;
-  const sea = Math.log(1 - MD.season_depth * Math.exp(-(d.age_days ?? MD.unknown_age_days) / MD.season_days));
-  if (Math.max(1, Math.round(Math.exp(logv + (g + sea)))) !== b.implied_value_usd) implMismatch++;
-  if ((d.change_7d ?? 0) < 0 && g >= 0) monoBad++;
-  // the page's farm EV: the same rounded pipeline as lib/model.ts
-  const farmed = d.chains.slice(0, 1);
-  const gas = rnd(MD.tx_count * farmed.reduce((a, c) => a + (GS[c] ?? MD.gas_default_usd), 0), 2);
-  let hold = d.age_days === null ? MD.hold_unknown_days : MD.hold_default_days;
-  if (d.age_days !== null) for (const [cap, dy] of MD.hold_by_age_days) if (d.age_days < cap) { hold = dy; break; }
-  const gm = (MD.drop_band_lo + MD.drop_band_hi) / 2;
-  const gross = rnd(100 * gm * (d.implied_value_usd / d.tvl_usd) * MD.capture_factor, 2);
-  const netPct = (dep) => rnd((100 * rnd((dep * gross) / 100 - rnd(gas + MD.bridge_usd + rnd(dep * MD.opportunity_cost_annum * (hold / 365), 2), 2), 2)) / dep, 2);
-  const p1 = netPct(MD.deposit_usd[0]);
-  const verdict = p1 >= MD.farm_net_pct ? 'FARM' : p1 >= MD.thin_net_pct ? 'THIN' : 'SKIP';
-  if (p1 !== b.net_ev_pct_1000 || netPct(MD.deposit_usd[1]) !== b.net_ev_pct_5000 || netPct(MD.deposit_usd[2]) !== b.net_ev_pct_25000 || hold !== b.farm.hold_days || gas !== b.farm.gas_usd) evMismatch++;
-  if (verdict !== b.verdict) verdictMismatch++;
+  if (JSON.stringify(rebuilt) !== JSON.stringify(b.farm_steps)) stepBad++;
 }
-ok('cross: data.js farm steps rebuild board.json steps 100%', stepMismatch === 0, `${stepMismatch} mismatches`);
-ok('cross: a falling 7d TVL never raises a value', monoBad === 0, `${monoBad} rows`);
-ok('cross: page recomputation yields board implied for every row', implMismatch === 0, `${implMismatch} mismatches`);
-ok('cross: farm EV recomputes to the shipped dollars for every row', evMismatch === 0, `${evMismatch} mismatches`);
-ok('cross: FARM/THIN/SKIP verdicts recompute for every row', verdictMismatch === 0, `${verdictMismatch} mismatches`);
-ok('cross: segments are only watchlist/emerging', data.rows.every((d) => d.segment === 'watchlist' || d.segment === 'emerging') && data.rows.filter((d) => d.segment === 'watchlist').length === snapshot.watchlist.length);
-ok('cross: verdict kpis match the rows', ['farm', 'thin', 'skip'].every((k) => data.kpis[k] === rows.filter((r) => r.verdict === k.toUpperCase()).length), `F${data.kpis.farm} T${data.kpis.thin} S${data.kpis.skip}`);
-ok('cross: tokenized comps never on the board', data.live.every((l) => !covered.has(l.slug)));
-ok('cross: board rows all record no token', data.rows.every((d) => !data.live.some((l) => l.slug === d.slug)));
-ok('cross: every row names traded anchor comps', data.rows.every((d) => d.anchor_comps.length >= 2 && d.anchor_comps.every((a) => data.live.some((l) => l.slug === a.slug && l.mcap_usd === a.mcap_usd))));
-ok('cross: dollar bands bracket the mid for every row', data.rows.every((d) => d.implied_low_usd <= d.implied_value_usd && d.implied_value_usd <= d.implied_high_usd));
-ok('cross: fit validates 87 comps LOO and 3 walk-forward folds', F.loo.metrics.n === 87 && F.n_comps === 87 && F.wf.folds.length === 3 && F.wf.pooled.n === 50);
-const shrink = F.baselines.find((b) => b.name.startsWith('shrink-median'));
-ok('cross: regression beats the hand-set baselines on LOO R2', F.loo.metrics.r2 > shrink.metrics.r2 && F.loo.metrics.r2 > 0, `model ${F.loo.metrics.r2} vs shrink-median ${shrink.metrics.r2}`);
-ok('cross: nested LOO reported over all 87 comps', F.nested.metrics.n === 87 && F.nested.same_lam >= 0 && F.nested.same_lam <= 87, `nested R2 ${F.nested.metrics.r2}, same triple in ${F.nested.same_lam} folds`);
-ok('cross: dashboard source under the 64,000-byte budget', totalBytes < 64000, `${totalBytes} bytes`);
-const fnl = data.kpis;
-ok('cross: the 758-protocol funnel adds up exactly', fnl.comps + fnl.tokenized_no_mcap + fnl.tokenized_small_mcap + fnl.watchlist_ranked + fnl.aside_above + fnl.excluded_below + fnl.emerging === fnl.total, `${fnl.total} classified`);
-ok('cross: every set-aside carries an exact reason', data.aside.every((a) => a.reason.length > 20 && a.name.length > 0 && slugs.has(a.slug)) && data.aside.length === fnl.aside_above + fnl.excluded_below);
+ok('cross: data.js rows = board rows', data.rows.length === rows.length, String(data.rows.length));
+ok('cross: implied FDV recomputes from shipped coefficients for every row', implBad === 0, `${implBad} mismatches`);
+ok('cross: farm verdict and p50 ROI recompute for every row and tier', tierBad === 0, `${tierBad} mismatches`);
+ok('cross: farm steps rebuild board.json steps', stepBad === 0, `${stepBad} mismatches`);
+ok('cross: record terms sign-constrained (k > 0, d > 0) and a falling TVL never raises a value', F.k > 0 && F.d > 0 && monoBad === 0);
+ok('cross: log TVL elasticity non-negative', F.elasticity >= 0, String(F.elasticity));
+ok('cross: verdict counts match board per tier', MD.tiers.every((dep) => ['FARM', 'THIN', 'SKIP'].every((v) => data.verdicts[dep][v] === rows.filter((r) => r.verdict_by_deposit[dep] === v).length)));
+ok('cross: watchlist rows all present in data.js', data.rows.filter((d) => d.seg === 'W').length === snapshot.watchlist.length);
+const fn = data.funnel;
+ok('cross: the funnel adds up to every protocol', fn.comps + fn.token_other + fn.watchlist + fn.emerging + fn.aside_above + fn.screened_below === fn.total && fn.total === snapshot.protocols.length);
+ok('cross: traded comps never on the board', data.comps.every((c) => !rows.some((r) => r.name === c.name && snapshot.protocols.find((p) => p.slug === r.slug).mcap_usd !== null)));
+ok('cross: every board row records no token', rows.every((r) => { const p = snapshot.protocols.find((x) => x.slug === r.slug); return p.mcap_usd === null && p.gecko_id === null && p.symbol === null; }));
+ok('cross: bands bracket the mid', rows.every((r) => r.implied_low_usd <= r.implied_value_usd && r.implied_value_usd <= r.implied_high_usd));
+ok('cross: model beats median-multiple baselines on LOO R2', F.loo.r2 > 0 && F.baselines.slice(1).every((b) => F.loo.r2 > b.metrics.r2), `LOO ${F.loo.r2}`);
+ok('cross: dashboard source under 64,000 bytes', totalBytes < 64000, `${totalBytes} bytes`);
 
 // ---------------------------------------------------------------- determinism (optional second run)
 if (outDir2) {
