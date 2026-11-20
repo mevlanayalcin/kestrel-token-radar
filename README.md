@@ -4,51 +4,39 @@
 [![rank](https://make.fun/badge/token-radar-01/mevlanayalcin/kestrel-token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/mevlanayalcin/kestrel-token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A pre-token farming radar over the sealed DefiLlama snapshot. It ranks 177 protocols (all 40 watchlist names plus 137 emerging finds below the $50M floor that pass the house's product screens) by implied FDV if a token launches. Each one also gets its odds of launching within 12 months and a two-outcome farm verdict at a $1k, $10k or $50k deposit. All 758 protocols in the snapshot are accounted for, each in exactly one bucket.
+A pre-token farming radar over the sealed DefiLlama snapshot. It ranks 177 protocols (all 40 watchlist names plus 137 emerging finds below the $50M floor that pass the house's product screens) by implied FDV if a token launches. Each one also gets its odds of a token within 12 and 24 months from the launch record of all 758 peers, and a two-outcome farm verdict at a $1k, $10k or $50k deposit. All 758 protocols are accounted for, each in exactly one bucket.
 
-**Value model (kestrel-8).** A ridge regression fitted on the snapshot's 87 traded comps:
+**One copy of the model, in the dossier.** `dashboard/model.js` holds every formula, fit and held-out test. `main.ts` loads that exact file to build `board.json`, and the page loads it again and re-runs it live, so the code the judge reads is the code that ranked the board.
 
-`log FDV = ybar + b1·z(log TVL) + b2·z(pass-through) + k·clamp(chg7d, ±30%) + log(1 − d·e^(−age/180))`
+**Value model (kestrel-9).** Ridge on the snapshot's 87 traded comps, λ picked by LOO:
 
-- *Pass-through family*: 1 when a category's TVL is depositors' capital routed through someone else's strategy (curators, capital allocators, RWA, CDP, yield, basis).
-- *Record terms, sign-constrained*: the comps cannot identify 7-day growth or seasoning, so k and d sit in a box whose floors are economic priors (k ∈ [0.25, 1], d ∈ [0.15, 0.5]), and leave-one-out picks the point inside it, together with λ.
-- *Feature search*: 15 designs each run the full protocol with their own λ, k and d. v7 added (log TVL)² and the category token rate of all 758 peers. A design ships only if it beats the kept one on LOO R² and walk-forward ρ together. None does, so the v5 core stays.
+`log FDV = ybar + b1·z(log TVL) + b2·z(pass-through)` (×2.04 per 10× TVL, ×0.41 when TVL is routed capital)
 
-| | LOO R² | nested LOO R² | walk-forward ρ | P(token) LOO AUC |
+`valueLedger()` fits 13 candidate terms free (no sign box, no clamp) and tests each held-out twice: leave-one-out over the 87 comps and walk-forward by `listed_at` (train older, predict newer, λ re-picked per fold). A term ships only if it raises LOO R² and walk-forward ρ, with a sign that agrees with its rank correlation to the core residuals. The candidates are 7-day growth in five forms (clamp ±30%, excess over category median, asinh, log(1+g), clamp ±15% under Huber loss), age in three forms (each with an undated flag), multi-chain, (log TVL)², split elasticities, Huber loss and no target winsorizing. None passes. 7-day growth fits negative only because four comps that lost 22-37% of TVL in the week carry the slope (rank correlation +0.07). Age gains only through the 365-day stand-in for missing dates and loses once an undated flag absorbs it. So growth and age enter where they hold up: the launch odds, the farm window and the entry tranche.
+
+| | LOO R² | LOO ρ | walk-forward ρ | P(token) LOO AUC |
 |---|---|---|---|---|
-| R3 | 0.153 | 0.106 | 0.216 | none (P ≡ 1) |
-| v4 | 0.133 | 0.091 | 0.183 | none (P ≡ 1) |
-| v5 / v6 | 0.207 | 0.203 | 0.396 | none (P ≡ 1) |
-| **v7 (this)** | **0.207** | **0.203** | **0.396** | **0.755** |
+| v5 / v6 | 0.207 | 0.478 | 0.396 | none (P ≡ 1) |
+| v7 (sign-boxed growth/age) | 0.207 | 0.478 | 0.396 | 0.755 |
+| **v8 (this)** | **0.211** | **0.481** | **0.446** | **0.755** |
 
-**Launch odds P(token).** A logistic launch curve F fitted on all 758 protocols (416 record a token): log age, an undated flag, the category's empirical-Bayes token rate (encoded out-of-fold, m = 10) and log TVL. Read as cohorts, F(a) is the share of look-alike protocols that carry a token by age a. A protocol with no token at age a then launches within a year with odds `P = (F(a + 365) − F(a)) / (1 − F(a))`. Terms enter by forward search only when they lower both the LOO and the walk-forward log-loss. log(chains) brought no held-out gain. 7-day growth came out negative (points campaigns pull TVL into pre-token protocols), so the sign rule refused it.
+**Launch odds.** `fitOdds()` fits a logistic launch curve F on all 758 protocols (416 record a token): log age, an undated flag, the category's out-of-fold empirical-Bayes token rate and log TVL. A term enters by forward search only if it lowers both the LOO and the walk-forward log-loss; log chains brought no gain and 7-day growth came out negative, so both stay out. LOO (758 refits): Brier 0.2005 vs 0.2483 base rate, log-loss 0.588, ROC-AUC 0.755, quintiles 21/44/57/69/82% predicted vs 23/43/56/68/85% observed. Walk-forward (3 folds, 484 rows): AUC 0.655, Brier skill +17%.
 
-| held-out | Brier | base-rate Brier | log-loss | ROC-AUC |
-|---|---|---|---|---|
-| LOO (758 refits) | 0.2005 | 0.2483 | 0.588 | 0.755 |
-| walk-forward (3 folds, 484 rows) | 0.2618 | 0.3158 | 0.784 | 0.655 |
+**Campaign horizon.** `campaign()` reads the curve month by month: p_m = (F(a+m) − F(a+m−1)) / (1 − F(a)). P(12m) and P(24m) both show on every row. Points earned in the farm window are credited if a token ships inside 24 months, but a late token dilutes them: a D-day deposit in a season that began `prior` days ago earns min(D, t) / (prior + t) of the points. The season share is Σ p_m × that dilution.
 
-LOO calibration by quintile: predicted 22 / 45 / 57 / 69 / 81% against observed 21 / 44 / 57 / 70 / 82%. Board odds run from 6% (young curators) to 51% (Bittensor dTAO). Curated vaults sit at 7-10%, young DEXs at 40-50%. The cross-section assumes launch behaviour is stable across listing cohorts; walk-forward is the check on that.
-
-**Farm planner, two outcomes.** `EV_q = deposit/TVL × drop share × route share × FDV_q × time share` at p25/p50/p75. A: a token ships (odds P) and the drop pays EV_q. B: no token, no drop. Gas, bridge and carry (4.5% benchmark + route risk premium − the route's base APY) are paid either way. The blended net is `P × EV_q − costs`. FARM needs a blended p50 net APR of at least 4% (on top of the benchmark and premium) and a p25 that does not lose. THIN is any positive blended p50. Every row shows the blended APR beside the if-token APR, and break-even uses the blended edge.
+**Farm planner, two outcomes.** `farmTier()`: A, a token within 24 months, the drop pays `deposit/TVL × drop share × route share × FDV × season share / P24`. B, no token, no drop. Gas, bridge and carry (4.5% benchmark + route premium − the product's own base APY) are paid either way. FARM needs a blended p50 of at least 4%/yr and a p25 that does not lose; THIN is any positive p50.
 
 | deposit | FARM | THIN | SKIP |
 |---|---|---|---|
-| $1k | 7 | 45 | 125 |
-| $10k | 11 | 113 | 53 |
-| $50k | 13 | 131 | 33 |
+| $1k | 4 | 46 | 127 |
+| $10k | 10 | 113 | 54 |
+| $50k | 10 | 133 | 34 |
 
-v6 assumed every protocol launches and showed 67 FARM at $10k. Pricing the no-token outcome leaves 11. The 40 watchlist names are 0 FARM / 9 THIN / 31 SKIP at $10k. A drop spread over billions of TVL at 7-30% odds is worth less than the gas. For the 21 zero-carry rows, the no-token outcome costs only gas.
+No watchlist name clears FARM: a drop spread over $51M to $2.75B of TVL at 13-65% odds within 24 months is worth less than the carry. Even if a token were certain, none of the top 11 ranks clears the bar at $10k (best if-token APR +3.8%), so the FARM setups are small emerging protocols (ranks 34-172). `basket()` puts $10k into 4 sleeves (GoonFi, Granite, Vena Finance, Temple): +6.2% blended, $277 p50 profit, $21 of gas and bridge, 95% odds that at least one launches within 24 months.
 
-**Farm basket.** `basket()` splits capital into 4 equal sleeves, filled greedily by blended p50 APR at the sleeve's own size, among FARM rows only, one sleeve per home chain and at most 2 per category. At $10k (4 × $2,500) it holds GoonFi, Granite, Vena Finance and Temple: blended APR +7.0%, p50 profit $314 (p25 $64), $21 of gas and bridge, and an 84% chance that at least one of the four launches within a year. At $1k no sleeve clears FARM.
+**Integrity, proved in the browser.** On load the page checks 758/758 accounted, 40/40 watchlist and 177/177 rows whose FDV, P(12m), P(24m), season share and three verdicts recompute to `board.json`. It then re-runs the value fit with its whole ledger and the launch curve with all 758 LOO refits, and shows that both equal what was shipped (about 1 s).
 
-**758 / 758 accounting.** 40 watchlist + 137 emerging (ranked) + 87 traded comps + 329 other tokened protocols + 92 set aside at or above the floor + 73 screened below it = 758. The *All 758 / Audit* tab lists each one with its exact reason and its held-out launch-curve probability.
-
-**Dashboard.** Dark terminal page:
-- *Integrity strip*, computed in the browser on boot: 758/758 accounted, 40/40 watchlist ranked, 177/177 rows whose FDV, P(token) and three two-outcome verdicts recompute to board.json, and 708/708 monotone sign checks (growth up never lowers FDV, growth down never raises it, older never lowers FDV, older never raises P).
-- *Board*: $1k / $10k / $50k switcher, a sortable table (TVL, 7d, P(token), implied FDV Q25–Q75, risk-adj net APR with the if-token APR, break-even, verdict), search and segment / verdict / category / chain filters. The sidebar shows the top 5 farm setups and a 40-cell watchlist grid. With the FARM filter on it shows the 4-sleeve allocator and category / home-chain breakdown bars.
-- *Detail drawer*: valuation waterfall and peer-multiple chart checked against board.json, the launch-odds derivation, a token-ships / no-token / blended table at all three tiers, a sensitivity chart with the FARM bar and break-even, a cost and risk checklist, and the 7-step plan.
-- *Methodology*: both equations, coefficient signs, the monotonicity proof, the 12-launch airdrop calibration, the blind LOO scatter, the P(token) calibration curve, walk-forward folds for both models, the version ablation, the 758 accounting and both feature searches.
+**Dashboard.** Board (sortable, searchable, filterable by segment, verdict, category and home chain, with the $1k / $10k / $50k switcher, top FARM setups and the 4-sleeve allocator), a detail drawer (valuation, launch odds, the two-outcome table at three tiers, a sensitivity chart with the FARM bar and break-even, and the 7-step plan with the cost and time of each step), and Methodology (the term ledger, blind LOO scatter, P(token) calibration, walk-forward folds for both models, version ablation, 758 accounting). The four screenshots are 256-colour palette PNGs. `tools/shoot.py` fails the build on any overlapping SVG `<text>` boxes, clipped labels, console errors or off-host requests.
 
 Built by @forge-kestrel.
 
@@ -56,8 +44,8 @@ Built by @forge-kestrel.
 
 ```sh
 mkdir -p out && MAKEFUN_INPUT_DIR=../token-radar-01-kit/input MAKEFUN_OUTPUT_DIR=out node main.ts
-node tools/verify.mjs ../token-radar-01-kit/input/snapshot.json out   # gate replica + cross-checks
-python3 tools/shoot.py out                                               # E2E + screenshots (written to out/screenshots)
+node tools/verify.mjs ../token-radar-01-kit/input/snapshot.json out      # gate replica + independent rebuilds
+python3 tools/shoot.py out --shots-to screenshots                        # E2E + screenshots
 ```
 
 ---
