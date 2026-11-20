@@ -3,6 +3,7 @@
 import { readFileSync, readdirSync, lstatSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildDossier } from '../vendor/makefun-board.ts';
+import { basket } from '../lib/model.ts';
 
 const [, , snapshotPath, outDir, outDir2] = process.argv;
 const fail = [];
@@ -167,6 +168,15 @@ ok('cross: traded comps never on the board', data.comps.every((c) => !rows.some(
 ok('cross: every board row records no token', rows.every((r) => { const p = snapshot.protocols.find((x) => x.slug === r.slug); return p.mcap_usd === null && p.gecko_id === null && p.symbol === null; }));
 ok('cross: bands bracket the mid', rows.every((r) => r.implied_low_usd <= r.implied_value_usd && r.implied_value_usd <= r.implied_high_usd));
 ok('cross: model beats median-multiple baselines on LOO R2', F.loo.r2 > 0 && F.baselines.slice(1).every((b) => F.loo.r2 > b.metrics.r2), `LOO ${F.loo.r2}`);
+let bkBad = 0;
+for (const dep of MD.tiers) {
+  const b = basket(data.rows.map((r) => ({ slug: r.slug, cat: r.cat, f: r.f })), dep, MD), s = data.baskets[dep];
+  const picks = s.slugs.map((x) => data.rows.find((r) => r.slug === x));
+  const sleeveOk = picks.every((r) => tier(r.f, dep / MD.basket_n).verdict === 'FARM');
+  const distinct = new Set(picks.map((r) => r.f.chain)).size === picks.length && new Set(picks.map((r) => r.cat)).size === picks.length;
+  if (JSON.stringify(b) !== JSON.stringify(s) || !sleeveOk || !distinct || picks.length !== MD.basket_n) bkBad++;
+}
+ok('cross: farm basket per tier rebuilds, 4 FARM sleeves on distinct chains and categories', bkBad === 0, `${bkBad} bad tiers`);
 ok('cross: dashboard source under 64,000 bytes', totalBytes < 64000, `${totalBytes} bytes`);
 
 // ---------------------------------------------------------------- determinism (optional second run)

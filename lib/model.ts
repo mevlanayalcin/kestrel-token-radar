@@ -1,4 +1,4 @@
-// Kestrel Token Radar: the fitted valuation model, the farm planner and the board builder (kestrel-6).
+// Kestrel Token Radar: the fitted valuation model, the farm planner and the board builder (kestrel-7).
 //
 // One sealed snapshot in, one ranked board out. Every number derives from the snapshot's ten fields;
 // no protocol name is special-cased anywhere.
@@ -25,6 +25,10 @@
 // - validation     LOO (87 blind refits); strict nested LOO (penalty AND record box re-selected inside
 //                  each of the 87 folds); temporal walk-forward (4 listed_at cohorts, train on older,
 //                  predict newer, selection re-run per fold); baselines under the same LOO pass.
+// - v6 search      13 designs (interaction and split elasticities, a 3-family taxonomy, category / chain
+//                  FE, chain footprint, category share and rank, Huber loss) each run this whole protocol
+//                  with their own (lam, k, d). A design ships only if it beats the kept one on LOO R2 and
+//                  walk-forward rho together; none does, so kestrel-7 keeps the v5 two-feature core.
 //
 // FARM PLANNER (deposit-sized, recomputed live by the page for $1k / $10k / $50k)
 //
@@ -64,7 +68,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_VERSION = 'kestrel-6';
+export const MODEL_VERSION = 'kestrel-7';
 
 /** Every constant the model and the planner use; data.js ships them and the page recomputes from them. */
 export const MODEL = {
@@ -91,6 +95,7 @@ export const MODEL = {
   farm_apr: 8,
   farm_p25_apr: 0,
   whale_tvl_share: 0.01,
+  basket_n: 4,
 };
 export type ModelConstants = typeof MODEL;
 
@@ -233,6 +238,23 @@ function ridge(X: number[][], y: number[], idx: number[], lam: number, nonneg: b
 }
 const predictRidge = (m: Ridge, x: number[]): number => x.reduce((a, v, j) => a + m.beta[j]! * ((v - m.mu[j]!) / m.sd[j]!), m.ybar);
 
+/**
+ * Huber M-estimate of the same ridge (c = 0 is plain squares): Huber's pseudo-observation iteration,
+ * y* = fit + clip(residual, +-c*MAD/0.6745), eight passes from the squares fit.
+ */
+function robustRidge(X: number[][], y: number[], idx: number[], lam: number, nonneg: boolean[], c: number): Ridge {
+  let m = ridge(X, y, idx, lam, nonneg);
+  if (c <= 0) return m;
+  for (let it = 0; it < 8; it++) {
+    const r = idx.map((i) => y[i]! - predictRidge(m, X[i]!));
+    const s = (c * quantile(r.map(Math.abs), 0.5)) / 0.6745 || 1;
+    const ys = y.slice();
+    idx.forEach((i, a) => { ys[i] = y[i]! - r[a]! + clamp(r[a]!, -s, s); });
+    m = ridge(X, ys, idx, lam, nonneg);
+  }
+  return m;
+}
+
 // ---------------------------------------------------------------- features
 
 /** The record terms in log space: growth k*clamped 7d change, seasoning log(1 - d*exp(-age/T)). */
@@ -243,24 +265,40 @@ export function recordLog(change7d: number | null, age: number | null, k: number
 }
 
 const L2 = new Set(['Arbitrum', 'Base', 'Optimism', 'Linea', 'Scroll', 'zkSync Era', 'Mantle', 'Ink', 'Unichain', 'Starknet']);
+/** The v6 search's 3-family taxonomy: own-fee trading/infra and credit/staking; the rest of own-fee is the base. */
+const CORE_INFRA = new Set(['Dexs', 'Derivatives', 'Perpetuals', 'Options', 'Prediction Market', 'Indexes', 'Chain', 'Bridge', 'Cross Chain Bridge', 'Canonical Bridge']);
+const CREDIT = new Set(['Lending', 'Uncollateralized Lending', 'Collateral Markets', 'Liquid Staking', 'Liquid Restaking', 'Restaking', 'Staking Pool']);
 
-/** Candidate designs the feature search scores under one LOO pass; [0] is never dropped. */
-function candidateDesigns(comps: SnapshotProtocol[], asOf: string) {
+/** A candidate design: its columns, which columns may not go negative, and its loss (Huber c, 0 = squares). */
+interface Design { name: string; f: (p: SnapshotProtocol) => number[]; nonneg: boolean[]; huber: number }
+
+/** Candidate designs the feature search scores under the full protocol; [1] is the shipped design. */
+function candidateDesigns(comps: SnapshotProtocol[], snapshot: Snapshot): Design[] {
   const cnt = new Map<string, number>();
   for (const c of comps) cnt.set(categoryOf(c), (cnt.get(categoryOf(c)) ?? 0) + 1);
   const cats = [...cnt.entries()].filter(([, n]) => n >= 6).map(([c]) => c).sort(byStr);
   const homes = ['Ethereum', 'Bitcoin', 'Binance', 'Solana'];
-  const lt = (p: SnapshotProtocol) => Math.log(p.tvl_usd);
+  const catTvl = new Map<string, number>();
+  for (const p of snapshot.protocols) catTvl.set(categoryOf(p), (catTvl.get(categoryOf(p)) ?? 0) + p.tvl_usd);
+  const lt = (p: SnapshotProtocol) => round(Math.log(p.tvl_usd), 4);
   const ps = (p: SnapshotProtocol) => (PASS_THROUGH.has(categoryOf(p)) ? 1 : 0);
-  const ag = (p: SnapshotProtocol) => Math.log(1 + (ageDays(asOf, p.listed_at) ?? MODEL.unknown_age_days) / 365);
+  const lc = (p: SnapshotProtocol) => Math.log(Math.max(1, p.chains.length));
+  const rankIn = (p: SnapshotProtocol) => Math.log(1 + snapshot.protocols.filter((q) => categoryOf(q) === categoryOf(p) && q.tvl_usd > p.tvl_usd).length);
+  const D = (name: string, f: (p: SnapshotProtocol) => number[], nonneg: boolean[] = [true], huber = 0): Design => ({ name, f, nonneg, huber });
   return [
-    { name: 'log TVL alone', f: (p: SnapshotProtocol) => [lt(p)] },
-    { name: '+ pass-through family', f: (p: SnapshotProtocol) => [lt(p), ps(p)] },
-    { name: '+ family + category FE (6+ comps)', f: (p: SnapshotProtocol) => [lt(p), ps(p), ...cats.map((c) => (categoryOf(p) === c ? 1 : 0))] },
-    { name: '+ family + home-chain FE (ETH/BTC/BSC/SOL/L2)', f: (p: SnapshotProtocol) => [lt(p), ps(p), ...homes.map((h) => (p.chains[0] === h ? 1 : 0)), L2.has(p.chains[0] ?? '') ? 1 : 0] },
-    { name: '+ family + log(chains)', f: (p: SnapshotProtocol) => [lt(p), ps(p), Math.log(Math.max(1, p.chains.length))] },
-    { name: '+ family + free 7d growth', f: (p: SnapshotProtocol) => [lt(p), ps(p), clamp(p.change_7d ?? 0, -30, 30) / 100] },
-    { name: '+ family + free log age', f: (p: SnapshotProtocol) => [lt(p), ps(p), ag(p)] },
+    D('log TVL alone', (p) => [lt(p)]),
+    D('+ pass-through family (v5, kept)', (p) => [lt(p), ps(p)]),
+    D('+ pass × log TVL interaction', (p) => [lt(p), ps(p), ps(p) * (lt(p) - 18)]),
+    D('split own-fee / pass-through elasticity', (p) => [lt(p) * (1 - ps(p)), lt(p) * ps(p), ps(p)], [true, true]),
+    D('3 families: + credit / staking', (p) => [lt(p), ps(p), CREDIT.has(categoryOf(p)) ? 1 : 0]),
+    D('3 families: + core trading / infra', (p) => [lt(p), ps(p), CORE_INFRA.has(categoryOf(p)) ? 1 : 0]),
+    D('+ category FE (6+ comps)', (p) => [lt(p), ps(p), ...cats.map((c) => (categoryOf(p) === c ? 1 : 0))]),
+    D('+ home-chain FE (ETH/BTC/BSC/SOL/L2)', (p) => [lt(p), ps(p), ...homes.map((h) => (p.chains[0] === h ? 1 : 0)), L2.has(p.chains[0] ?? '') ? 1 : 0]),
+    D('+ log(chains)', (p) => [lt(p), ps(p), lc(p)]),
+    D('+ log TVL per chain', (p) => [lt(p), ps(p), lt(p) - lc(p)]),
+    D('+ category TVL share', (p) => [lt(p), ps(p), Math.log(p.tvl_usd / catTvl.get(categoryOf(p))!)]),
+    D('+ TVL rank inside category', (p) => [lt(p), ps(p), rankIn(p)]),
+    D('v5 design, Huber loss (c 1.345)', (p) => [lt(p), ps(p)], [true], 1.345),
   ];
 }
 
@@ -268,7 +306,7 @@ function candidateDesigns(comps: SnapshotProtocol[], asOf: string) {
 
 export interface LooPoint { slug: string; name: string; category: string; tvl_usd: number; mcap_usd: number; pred_usd: number; resid: number }
 export interface WfFold { from: string; to: string; train_n: number; test_n: number; metrics: ValMetrics }
-export interface FeatureTry { name: string; r2: number; rho: number; beta_last: number; chosen: boolean }
+export interface FeatureTry { name: string; r2: number; rho: number; within2x: number; wf_r2: number; wf_rho: number; betas: number[]; chosen: boolean }
 export interface ModelFit {
   equation: string;
   n_comps: number;
@@ -314,59 +352,81 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL) {
   for (const lam of model.lam_grid) for (const k of model.k_grid) for (const d of model.d_grid) {
     combos.push({ lam, k, d, off: comps.map((c) => { const r = recordLog(c.change_7d, age(c), k, d, model); return r.growth + r.season; }) });
   }
-  const looPred = (train: number[], c: (typeof combos)[number]) => {
-    const yt = Yw.map((y, i) => y - c.off[i]!);
-    return train.map((i) => predictRidge(ridge(X, yt, train.filter((j) => j !== i), c.lam, nonneg), X[i]!) + c.off[i]!);
+  type Combo = (typeof combos)[number];
+  /** The whole selection-and-validation protocol for one design matrix, its sign mask and its loss. */
+  const protocol = (Xd: number[][], nn: boolean[], huber: number) => {
+    const fit = (yt: number[], train: number[], lam: number) => robustRidge(Xd, yt, train, lam, nn, huber);
+    const looPred = (train: number[], c: Combo) => {
+      const yt = Yw.map((y, i) => y - c.off[i]!);
+      return train.map((i) => predictRidge(fit(yt, train.filter((j) => j !== i), c.lam), Xd[i]!) + c.off[i]!);
+    };
+    /** The (lam, k, d) whose LOO over `train` alone scores the best R2 on the actual log(mcap). */
+    const select = (train: number[]) => {
+      let best = combos[0]!, bestR2 = -Infinity;
+      for (const c of combos) {
+        const r2 = metrics(looPred(train, c), train.map((i) => Y[i]!)).r2;
+        if (r2 > bestR2) { bestR2 = r2; best = c; }
+      }
+      return best;
+    };
+    const fitOn = (train: number[], c: Combo) => fit(Yw.map((y, i) => y - c.off[i]!), train, c.lam);
+    // Walk-forward: dated comps in listed_at cohorts; undated comps train every fold, test none.
+    const walk = () => {
+      const folds: WfFold[] = [];
+      const wp: number[] = [], wa: number[] = [];
+      for (let f = 1; f < C; f++) {
+        const train = [...undated, ...chunks.slice(0, f).flat()].sort((x, y) => x - y);
+        const test = chunks[f]!;
+        const c = select(train);
+        const m = fitOn(train, c);
+        const pr = test.map((i) => predictRidge(m, Xd[i]!) + c.off[i]!);
+        const ac = test.map((i) => Y[i]!);
+        wp.push(...pr); wa.push(...ac);
+        folds.push({ from: comps[test[0]!]!.listed_at!, to: comps[test[test.length - 1]!]!.listed_at!, train_n: train.length, test_n: test.length, metrics: metrics(pr, ac) });
+      }
+      return { folds, pooled: metrics(wp, wa) };
+    };
+    return { looPred, select, fitOn, walk };
   };
-  /** The (lam, k, d) whose LOO over `train` alone scores the best R2 on the actual log(mcap). */
-  const select = (train: number[]) => {
-    let best = combos[0]!, bestR2 = -Infinity;
-    for (const c of combos) {
-      const r2 = metrics(looPred(train, c), train.map((i) => Y[i]!)).r2;
-      if (r2 > bestR2) { bestR2 = r2; best = c; }
-    }
-    return best;
-  };
-  const chosen = select(all);
-  const fitOn = (train: number[], c: (typeof combos)[number]) => ridge(X, Yw.map((y, i) => y - c.off[i]!), train, c.lam, nonneg);
-  const full = fitOn(all, chosen);
-  const loo = looPred(all, chosen);
+  const dated = all.filter((i) => comps[i]!.listed_at !== null).sort((a, b) => byStr(comps[a]!.listed_at!, comps[b]!.listed_at!) || a - b);
+  const undated = all.filter((i) => comps[i]!.listed_at === null);
+  const C = model.wf_cohorts;
+  const chunks = [...Array(C).keys()].map((q) => dated.slice(Math.floor((q * dated.length) / C), Math.floor(((q + 1) * dated.length) / C)));
+
+  const P = protocol(X, nonneg, 0);
+  const chosen = P.select(all);
+  const full = P.fitOn(all, chosen);
+  const loo = P.looPred(all, chosen);
   const resid = loo.map((p, i) => Y[i]! - p);
 
   // Strict nested LOO: the whole selection re-runs on the other 86 before each comp is predicted.
   let nestedSame = 0;
   const nested = all.map((i) => {
     const train = all.filter((j) => j !== i);
-    const c = select(train);
+    const c = P.select(train);
     if (c === chosen) nestedSame++;
-    return predictRidge(fitOn(train, c), X[i]!) + c.off[i]!;
+    return predictRidge(P.fitOn(train, c), X[i]!) + c.off[i]!;
   });
+  const wf = P.walk();
 
-  // Walk-forward: dated comps in listed_at cohorts; undated comps train every fold, test none.
-  const dated = all.filter((i) => comps[i]!.listed_at !== null).sort((a, b) => byStr(comps[a]!.listed_at!, comps[b]!.listed_at!) || a - b);
-  const undated = all.filter((i) => comps[i]!.listed_at === null);
-  const C = model.wf_cohorts;
-  const chunks = [...Array(C).keys()].map((q) => dated.slice(Math.floor((q * dated.length) / C), Math.floor(((q + 1) * dated.length) / C)));
-  const folds: WfFold[] = [];
-  const wp: number[] = [], wa: number[] = [];
-  for (let f = 1; f < C; f++) {
-    const train = [...undated, ...chunks.slice(0, f).flat()].sort((a, b) => a - b);
-    const test = chunks[f]!;
-    const c = select(train);
-    const m = fitOn(train, c);
-    const pr = test.map((i) => predictRidge(m, X[i]!) + c.off[i]!);
-    const ac = test.map((i) => Y[i]!);
-    wp.push(...pr); wa.push(...ac);
-    folds.push({ from: comps[test[0]!]!.listed_at!, to: comps[test[test.length - 1]!]!.listed_at!, train_n: train.length, test_n: test.length, metrics: metrics(pr, ac) });
-  }
-
-  // Feature search: each candidate design under the same LOO pass and penalty, no record terms.
-  const features: FeatureTry[] = candidateDesigns(comps, snapshot.as_of).map((cand, ci) => {
+  // Feature search (v6): every candidate design runs the same protocol as the shipped one, its own
+  // (lam, k, d) chosen by LOO and its own walk-forward selection, so a candidate wins only on blind skill.
+  const cands = candidateDesigns(comps, snapshot);
+  const features: FeatureTry[] = cands.map((cand, ci) => {
     const Xc = comps.map(cand.f);
-    const pr = all.map((i) => predictRidge(ridge(Xc, Yw, all.filter((j) => j !== i), chosen.lam, []), Xc[i]!));
-    const m = ridge(Xc, Yw, all, chosen.lam, []);
-    return { name: cand.name, r2: metrics(pr, Y).r2, rho: metrics(pr, Y).rho, beta_last: round(m.beta[m.beta.length - 1]! / m.sd[m.sd.length - 1]!, 4), chosen: ci === 1 };
+    const Q = ci === 1 ? P : protocol(Xc, Xc[0]!.map((_, j) => cand.nonneg[j] ?? false), cand.huber);
+    const c = ci === 1 ? chosen : Q.select(all);
+    const m = ci === 1 ? metrics(loo, Y) : metrics(Q.looPred(all, c), Y);
+    const w = ci === 1 ? wf.pooled : Q.walk().pooled;
+    const fm = Q.fitOn(all, c);
+    return { name: cand.name, r2: m.r2, rho: m.rho, within2x: m.within2x, wf_r2: w.r2, wf_rho: w.rho, betas: fm.beta.map((b, j) => round(b / fm.sd[j]!, 4)), chosen: ci === 1 };
   });
+  // Free record terms, for the page's sign check: the same ridge with no record offsets.
+  const freeBeta = (extra: (p: SnapshotProtocol) => number) => {
+    const Xc = comps.map((p) => [...design(p), extra(p)]);
+    const m = ridge(Xc, Yw, all, chosen.lam, []);
+    return round(m.beta[2]! / m.sd[2]!, 4);
+  };
 
   // Baselines under the same LOO pass.
   const ratios = comps.map((c) => clamp(c.mcap_usd! / c.tvl_usd, 0.02, 20));
@@ -381,7 +441,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL) {
     { name: 'global median FDV/TVL multiple', metrics: metrics(medAll, Y) },
     { name: 'category median FDV/TVL multiple', metrics: metrics(catMed, Y) },
   ];
-  const lamGrid = combos.filter((c) => c.lam === chosen.lam).map((c) => ({ k: c.k, d: c.d, r2: metrics(looPred(all, c), Y).r2 }));
+  const lamGrid = combos.filter((c) => c.lam === chosen.lam).map((c) => ({ k: c.k, d: c.d, r2: metrics(P.looPred(all, c), Y).r2 }));
 
   const fit: ModelFit = {
     equation: 'log FDV = ybar + b1*z(log TVL) + b2*z(pass) + k*chg7d + log(1 - d*e^(-age/T))',
@@ -401,12 +461,12 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL) {
     loo: metrics(loo, Y),
     nested: metrics(nested, Y),
     nested_same: nestedSame,
-    wf: { folds, pooled: metrics(wp, wa) },
+    wf,
     resid_q: { q10: round(quantile(resid, 0.1), 4), q25: round(quantile(resid, 0.25), 4), q75: round(quantile(resid, 0.75), 4), q90: round(quantile(resid, 0.9), 4) },
     loo_points: comps.map((c, i) => ({ slug: c.slug, name: c.name, category: categoryOf(c), tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd!, pred_usd: Math.round(Math.exp(loo[i]!)), resid: round(resid[i]!, 4) })),
     features,
-    free_growth: features[5]!.beta_last,
-    free_age: features[6]!.beta_last,
+    free_growth: freeBeta((p) => clamp(p.change_7d ?? 0, -30, 30) / 100),
+    free_age: freeBeta((p) => Math.log(1 + (age(p) ?? model.unknown_age_days) / 365)),
     baselines,
     grid_r2: lamGrid,
   };
@@ -458,6 +518,36 @@ export function horizonWeeks(age: number | null, model: ModelConstants = MODEL):
 export interface FarmInput { tvl: number; fdv: [number, number, number]; chain: string; gas_tx: number; bridge: number; apy: number; prem: number; share: number; age: number | null; weeks: number }
 /** One deposit tier's economics. */
 export interface FarmTier { deposit: number; ev: [number, number, number]; gas: number; bridge: number; carry: number; net: [number, number, number]; roi: [number, number, number]; apr: [number, number, number]; airdrop_apr: number; breakeven: number | null; verdict: 'FARM' | 'THIN' | 'SKIP'; whale: boolean }
+
+/** Carry of locked capital in %/yr after the route's base APY; at or below zero the farm holds for free. */
+export const model_carry = (route: { apy: number; prem: number }, model: ModelConstants = MODEL): number => round(model.benchmark_apy + route.prem - route.apy, 2);
+
+/** One sleeve of the diversified basket. */
+export interface BasketPick { slug: string; tier: FarmTier }
+/**
+ * The diversified farm basket for `total` dollars: basket_n equal sleeves, filled greedily by p50 net
+ * APR at the sleeve's own size among FARM rows, no two sleeves on one home chain or in one category.
+ * Rows come in rank order; the page's basket() is this function line for line.
+ */
+export function basket(rows: { slug: string; cat: string; f: FarmInput }[], total: number, model: ModelConstants = MODEL) {
+  const sleeve = total / model.basket_n;
+  const cand = rows.map((r, i) => ({ r, i, t: farmTier(r.f, sleeve, model) })).filter((x) => x.t.verdict === 'FARM')
+    .sort((a, b) => b.t.apr[1] - a.t.apr[1] || a.i - b.i);
+  const picks: BasketPick[] = [];
+  const chains = new Set<string>(), cats = new Set<string>();
+  for (const x of cand) {
+    if (picks.length >= model.basket_n) break;
+    if (chains.has(x.r.f.chain) || cats.has(x.r.cat)) continue;
+    chains.add(x.r.f.chain); cats.add(x.r.cat);
+    picks.push({ slug: x.r.slug, tier: x.t });
+  }
+  const sum = (g: (t: FarmTier) => number) => round(picks.reduce((a, p) => a + g(p.tier), 0), 2);
+  return {
+    total, sleeve, slugs: picks.map((p) => p.slug),
+    net_p50: sum((t) => t.net[1]), net_p25: sum((t) => t.net[0]), costs: sum((t) => t.gas + t.bridge), carry: sum((t) => t.carry),
+    apr_p50: picks.length ? round(picks.reduce((a, p) => a + p.tier.apr[1], 0) / picks.length, 2) : 0,
+  };
+}
 
 /** Deposit-sized economics; the page's farmTier() is this function line for line. */
 export function farmTier(f: FarmInput, deposit: number, model: ModelConstants = MODEL): FarmTier {
@@ -521,9 +611,10 @@ export function farmSteps(p: SnapshotProtocol, f: FarmInput, route: Route, tiers
   const funding = f.chain === 'Ethereum'
     ? 'Withdraw USDC from an exchange straight to Ethereum mainnet (no bridge needed)'
     : `Withdraw USDC to Ethereum or an exchange that supports ${f.chain}, then move it to ${f.chain} with the chain's canonical or a major intent bridge`;
+  const freeCarry = model_carry(route) <= 0;
   const size = best === null
     ? `No tier clears the FARM bar: even at ${usd(t50.deposit)} the p50 return is ${pct(t50.roi[1])} over ${f.weeks} weeks (${pct(t50.apr[1])} a year), so use this plan only for stables you would park in ${p.name} anyway`
-    : `Size it at ${usd(best.deposit)} or more: ${best.verdict} there, netting ${pct(best.roi[1])} at p50 over the ${f.weeks}-week window (${pct(best.apr[1])} a year; p25 ${pct(best.roi[0])}, p75 ${pct(best.roi[2])}) after every cost`;
+    : `Size it at ${usd(best.deposit)} or more: ${best.verdict} there, netting ${pct(best.roi[1])} at p50 over the ${f.weeks}-week window (${pct(best.apr[1])} a year; p25 ${pct(best.roi[0])}, p75 ${pct(best.roi[2])}) after every cost${best.verdict === 'THIN' && freeCarry ? `. Zero-carry free option: the ${route.apy}% base yield covers benchmark and risk premium, so the drop is upside on stables held anyway` : ''}`;
   const tranche = g !== null && g >= 15
     ? `TVL jumped ${g.toFixed(1)}% in 7 days: put in half now and the rest only if TVL holds for two more weeks (a hot week can be an incentive campaign that ends)`
     : g !== null && g <= -15
@@ -647,6 +738,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL) {
     fit,
     funnel,
     verdicts: Object.fromEntries(model.tiers.map((d) => [String(d), { FARM: count(d, 'FARM'), THIN: count(d, 'THIN'), SKIP: count(d, 'SKIP') }])),
+    baskets: Object.fromEntries(model.tiers.map((d) => [String(d), basket(scored.map((s) => ({ slug: s.p.slug, cat: categoryOf(s.p), f: s.f })), d, model)])),
     rows: scored.map((s, i) => ({
       r: i + 1,
       slug: s.p.slug,

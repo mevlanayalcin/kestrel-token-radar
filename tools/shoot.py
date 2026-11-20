@@ -19,7 +19,7 @@ OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "/tmp/tr_out1")
 SAVE = "--no-shots" not in sys.argv
 SHOTS = os.path.join(OUT, "screenshots")
 W, H = 1440, 900
-TARGET_KB = (200, 275)  # four images must fit the 1.5 MiB dossier as base64
+TARGET_KB = (200, 262)  # four images must fit the 1.45 MiB dossier budget as base64
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -90,6 +90,8 @@ with sync_playwright() as pw:
         check(f"tier ${tier}: page recompute = board.json for all {len(got)} rows", not bad and len(got) == len(board), bad[:5])
         pills = page.evaluate("() => [...document.querySelectorAll('#grid tbody tr')].map(tr => [tr.dataset.slug, tr.querySelector('.pill').textContent])")
         check(f"tier ${tier}: every rendered verdict pill matches", all(by_slug[s]["verdict_by_deposit"][str(tier)] == v for s, v in pills) and len(pills) == len(board), len(pills))
+        bk = page.evaluate("(d) => { const b = basket(d), s = R.baskets[d]; return [JSON.stringify(b.p.map(x => x.r.slug)) === JSON.stringify(s.slugs) && b.net === s.net_p50 && b.p25 === s.net_p25 && b.costs === s.costs && b.apr === s.apr_p50, new Set(b.p.map(x => x.r.f.chain)).size === b.p.length && new Set(b.p.map(x => x.r.cat)).size === b.p.length, document.querySelectorAll('ol.bkl li').length === b.p.length, b.p.length]; }", tier)
+        check(f"tier ${tier}: basket recompute = data.js, distinct chains/categories, rendered", bk[0] and bk[1] and bk[2], bk)
         mix = page.evaluate("() => [...document.querySelectorAll('.kpi.wide em')].map(e => +e.textContent)")
         exp = [sum(1 for r in board if r["verdict_by_deposit"][str(tier)] == v) for v in ("FARM", "THIN", "SKIP")]
         check(f"tier ${tier}: KPI verdict mix {mix}", mix == exp, exp)
@@ -120,8 +122,8 @@ with sync_playwright() as pw:
         page.click(f"button[data-tab='{tab}']")
         page.wait_for_timeout(150)
         layout(f"tab {tab}")
-    dots = page.evaluate("() => (document.querySelector('button[data-tab=radar]').click(), document.querySelectorAll('.chart circle[data-slug]').length)")
-    check("radar: one dot per ranked row", dots == len(board), dots)
+    dots = page.evaluate("() => (document.querySelector('button[data-tab=radar]').click(), document.querySelectorAll('.chart.map circle[data-slug]').length)")
+    check("radar: one bubble per ranked row", dots == len(board), dots)
     page.click("button[data-tab='board']")
     page.wait_for_timeout(150)
 
@@ -133,25 +135,37 @@ with sync_playwright() as pw:
     shot("01-board-overview.jpg")
 
     # ---- 02 detail drawer of the best setup
-    page.click("ol.best li >> nth=0")
+    page.click("ol.bkl li >> nth=0")
     page.wait_for_timeout(400)
     st = page.evaluate("""() => { const d = document.getElementById('drawer'), st = d.querySelectorAll('ol.plan li');
       return {open: d.classList.contains('open'), name: d.querySelector('h2').textContent, pill: d.querySelector('.dk .pill').textContent,
         rec: d.querySelector('.mono').textContent, steps: st.length, last: Math.round(st[st.length - 1].getBoundingClientRect().bottom),
-        chart: Math.round(d.querySelector('svg.chart').getBoundingClientRect().bottom), scroll: d.scrollWidth - d.clientWidth}; }""")
+        chart: Math.round(d.querySelector('svg.sens').getBoundingClientRect().bottom), peer: d.querySelectorAll('svg.peer rect').length, scroll: d.scrollWidth - d.clientWidth}; }""")
     check(f"shot 02: drawer for {st['name']}", st["open"] and st["pill"] == "FARM", st["pill"])
     check("shot 02: waterfall recompute matches board", "✓ board" in st["rec"], st["rec"][-30:])
     check("shot 02: 7 plan steps and the sensitivity chart above the fold", st["steps"] == 7 and st["last"] <= H and st["chart"] <= H, (st["last"], st["chart"]))
     check("shot 02: drawer has no horizontal overflow", st["scroll"] <= 0, st["scroll"])
+    check("shot 02: peer comps bars (row + 3 anchors)", st["peer"] == 4, st["peer"])
+    sc = []
+    for k in ("cons", "fast", "base"):
+        page.click(f"button[data-scn='{k}']")
+        page.wait_for_timeout(80)
+        sc.append(page.evaluate("() => document.querySelector('.fe tr:nth-child(6) td.cur').textContent"))
+    check("shot 02: scenario stress recomputes the tier (cons < base, fast differs)", sc[0] != sc[2] and sc[1] != sc[2], sc)
     shot("02-protocol-detail-farm-plan.jpg")
     page.keyboard.press("Escape")
     page.wait_for_timeout(250)
 
-    # ---- 03 filtered: FARM verdicts in the emerging radar, sorted by net APR
-    page.select_option("#seg", "E")
-    page.click("button[data-v='FARM']")
-    page.click("th[data-sort='apr']")
-    page.wait_for_timeout(200)
+    # ---- 03 filtered radar: the opportunity map over every row with a positive p50 at $10k
+    page.click("button[data-tab='radar']")
+    page.click("button[data-v='EV']")
+    page.wait_for_timeout(250)
+    st = page.evaluate("() => ({dots: document.querySelectorAll('.chart.map circle').length, skip: document.querySelectorAll('.chart.map circle.SKIP').length, labels: [...document.querySelectorAll('.chart.map text.cl')].map(t => { const b = t.getBBox(); return {x: b.x, y: b.y, width: b.width, height: b.height}; }), cards: document.querySelectorAll('.card').length, cells: document.querySelectorAll('.ym td').length, bottom: Math.round(document.querySelector('.cards').getBoundingClientRect().bottom)})")
+    ov = sum(1 for i, a in enumerate(st["labels"]) for b in st["labels"][i + 1:] if a["x"] < b["x"] + b["width"] and b["x"] < a["x"] + a["width"] and a["y"] < b["y"] + b["height"] and b["y"] < a["y"] + a["height"])
+    exp = sum(1 for r in board if r["verdict_by_deposit"]["10000"] != "SKIP")
+    check(f"shot 03: map shows the {exp} p50 > 0 rows, no SKIP", st["dots"] == exp and st["skip"] == 0, st["dots"])
+    check(f"shot 03: {len(st['labels'])} callouts, none overlapping", len(st["labels"]) >= 8 and ov == 0, ov)
+    check("shot 03: yield matrix and FARM cards rendered", st["cards"] == 6 and st["cells"] >= 20, (st["cards"], st["cells"]))
     layout("shot 03")
     shot("03-filtered-emerging-radar.jpg")
     page.click("#reset")
@@ -161,6 +175,10 @@ with sync_playwright() as pw:
     page.wait_for_timeout(300)
     st = page.evaluate("() => ({loo: document.querySelectorAll('.mgrid svg.chart circle').length, heat: document.querySelectorAll('.heat td').length})")
     check("shot 04: 87 blind LOO points and the k x d grid", st["loo"] == 87 and st["heat"] == 16, st)
+    mono = page.evaluate("() => [...document.querySelectorAll('.mgrid b.pos')].map(b => b.textContent)")
+    check("shot 04: monotonicity holds on every row", len(mono) == 3 and all(m.startswith(f"{len(board)}/") for m in mono), mono)
+    st = page.evaluate("() => ({fs: document.querySelectorAll('.fsr tr').length - 1, n: R.fit.features.length})")
+    check("shot 04: full feature search table", st["fs"] == st["n"] and st["n"] >= 12, st)
     layout("shot 04")
     shot("04-model-methodology.jpg")
     browser.close()
