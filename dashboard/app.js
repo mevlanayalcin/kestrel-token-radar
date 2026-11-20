@@ -50,21 +50,28 @@
 
   // ------------------------------------------------------------ recompute (the page proves the board)
 
-  // exp of the fitted log: the same coefficients, standardization and summation order as lib/model.ts.
-  function impliedOf(x) {
-    var s = F.ybar;
-    for (var j = 0; j < x.length; j++) s += F.beta[j] * ((x[j] - F.mu[j]) / F.sd[j]);
-    return Math.max(1, Math.round(Math.exp(s)));
+  // the record terms (lib/model.ts recordLog): growth g x 7d change clamped to +-cap, and seasoning
+  // log(1 - d*exp(-age/T)): a falling TVL always lowers value, young TVL is priced as less sticky.
+  function recordOf(r) {
+    var g = M.growth_elasticity * Math.min(M.growth_cap_pct, Math.max(-M.growth_cap_pct, r.change_7d === null ? 0 : r.change_7d)) / 100;
+    var s = Math.log(1 - M.season_depth * Math.exp(-(r.age_days === null ? M.unknown_age_days : r.age_days) / M.season_days));
+    return { growth: g, season: s, total: g + s };
   }
-  // the same sum split by term: the multiplicative value bridge from a typical comp to this row.
-  function bridgeOf(x) {
-    var t = [0, 0, 0, 0, 0];
-    for (var j = 0; j < x.length; j++) t[Math.min(j, 4)] += F.beta[j] * ((x[j] - F.mu[j]) / F.sd[j]);
-    return t;
+  // exp of the fitted log plus the record offset: the same coefficients and order as lib/model.ts.
+  function impliedOf(r) {
+    var s = F.ybar;
+    for (var j = 0; j < r.x.length; j++) s += F.beta[j] * ((r.x[j] - F.mu[j]) / F.sd[j]);
+    return Math.max(1, Math.round(Math.exp(s + recordOf(r).total)));
+  }
+  // the same sum split by term: TVL, breadth, category, 7d growth, seasoning.
+  function bridgeOf(r) {
+    var t = [0, 0, 0], rec = recordOf(r);
+    for (var j = 0; j < r.x.length; j++) t[Math.min(j, 2)] += F.beta[j] * ((r.x[j] - F.mu[j]) / F.sd[j]);
+    return t.concat([rec.growth, rec.season]);
   }
   // the farm economics mirror: hold window, per-chain gas, bridge, carry, band, net, verdict.
   function evOf(r, capture) {
-    var farmed = r.chains.slice().sort().slice(0, 2), gas = 0;
+    var farmed = r.chains.slice(0, 1), gas = 0;
     for (var i = 0; i < farmed.length; i++) gas += G[farmed[i]] === undefined ? M.gas_default_usd : G[farmed[i]];
     gas = rd(M.tx_count * gas, 2);
     var hold = r.age_days === null ? M.hold_unknown_days : M.hold_default_days;
@@ -77,11 +84,12 @@
       var net = rd(d * gross / 100 - cost, 2);
       return { d: d, op: op, cost: cost, net: net, pct: rd((100 * net) / d, 2) };
     });
-    var p = t[0].pct;
+    var p = t[0].pct, cy = M.opportunity_cost_annum * (hold / 365);
+    var be = gross / 100 > cy ? Math.ceil((gas + M.bridge_usd) / (gross / 100 - cy)) : null;
     return {
-      gas: gas, hold: hold, gross: gross, t: t,
+      gas: gas, hold: hold, gross: gross, t: t, be: be,
       verdict: p >= M.farm_net_pct ? 'FARM' : p >= M.thin_net_pct ? 'THIN' : 'SKIP',
-      ok: p === r.net_ev_pct_1000 && t[1].pct === r.net_ev_pct_5000 && t[2].pct === r.net_ev_pct_25000 && gas === r.farm.gas_usd && hold === r.farm.hold_days
+      ok: p === r.net_ev_pct_1000 && t[1].pct === r.net_ev_pct_5000 && t[2].pct === r.net_ev_pct_25000 && gas === r.farm.gas_usd && hold === r.farm.hold_days && be === r.farm.breakeven_usd
     };
   }
 
@@ -329,13 +337,13 @@
       '<div><span class="k">LOO R²</span><b>' + lm.r2 + '</b><span class="s">ρ ' + lm.rho + '</span></div><div><span class="k">Nested LOO R²</span><b>' + nm.r2 + '</b><span class="s">ρ ' + nm.rho.toFixed(3) + '</span></div></div>' +
       '<table class="mini"><thead><tr><th>Term</th><th class="num">β (std)</th><th class="num">mean</th><th class="num">sd</th></tr></thead><tbody>';
     F.feature_names.forEach(function (n, i) { h += '<tr><td>' + esc(n) + '</td><td class="num"><b>' + F.beta[i] + '</b></td><td class="num">' + F.mu[i] + '</td><td class="num">' + F.sd[i] + '</td></tr>'; });
-    h += '</tbody></table><p>Target ' + esc(F.target) + '. Penalties ' + F.lam.join(' / ') + ' (size / noise / category) from a ' + F.lam_grid.map(function (g) { return g.length; }).join('x') + ' grid by LOO R²; the nested pass re-picks them blind in every fold (' + F.nested.same_lam + ' of ' + F.n_comps + ' folds pick the same triple).</p></div>';
+    h += '</tbody></table><p><b>Record offset, stated:</b> g ' + M.growth_elasticity + ' on 7d growth capped ±' + M.growth_cap_pct + '%; seasoning d ' + M.season_depth + ', T ' + M.season_days + ' days. Target ' + esc(F.target) + '. Penalties ' + F.lam.join(' / ') + ' (size / noise / category) from a ' + F.lam_grid.map(function (g) { return g.length; }).join('x') + ' grid by LOO R²; the nested pass re-picks them blind in every fold (' + F.nested.same_lam + ' of ' + F.n_comps + ' folds pick the same triple).</p></div>';
     h += '<div class="panel"><h3>Validation 1 — leave-one-out calibration<span class="q">' + lm.n + ' blind refits</span></h3>' + scatterLoo() +
       '<p><b>' + lm.within_2x_pct + '%</b> of comps land within 2x blind, median |ln err| <b>' + lm.med_abs_log_err + '</b>. The spread is the market’s: comps of one size trade from 0.003x to 400x TVL, so every row ships a band, never a point.</p></div>';
     h += '<div><div class="panel"><h3>Against the baselines<span class="q">identical LOO pass</span></h3><table class="mini"><thead><tr><th>Model</th><th class="num">R²</th><th class="num">ρ</th><th class="num">med err</th><th class="num">≤2x</th></tr></thead><tbody>' +
-      mrow('kestrel-4 ridge, LOO', lm, 'hi') + mrow('kestrel-4, nested LOO', nm, '', 'penalties re-selected inside each fold');
+      mrow(D.model_version + ', LOO', lm, 'hi') + mrow(D.model_version + ', nested LOO', nm, '', 'penalties re-selected inside each fold');
     F.baselines.forEach(function (b) { h += mrow(esc(b.name), b.metrics); });
-    h += '</tbody></table><p>The hand-set median multiples go <b>negative</b> on R²: they misprice levels by more than a flat constant. Blind and re-tuned, the ridge (nested R² ' + nm.r2 + ') ' + (nm.r2 > F.baselines[0].metrics.r2 ? 'edges' : 'does not beat') + ' TVL alone (' + F.baselines[0].metrics.r2 + '): on this snapshot the momentum, age and category terms add little blind skill, so every row ships a band and the verdict uses the mid.</p></div>';
+    h += '</tbody></table><p>Hand-set median multiples go <b>negative</b> on R²: they misprice levels. The record terms are priced on purpose: a traded token’s market cap carries years of history, so a week of growth barely explains it (' + F.baselines[0].metrics.r2 + ' R² without them), but a pre-token value “if the record stays as it is” must move with that record. A falling TVL never raises a value here. Every row ships a band and the verdict uses the mid.</p></div>';
     h += '<div class="panel"><h3>Validation 2 — temporal walk-forward<span class="q">older → newer</span></h3><table class="mini"><thead><tr><th>Test cohort (listed_at)</th><th class="num">train/test</th><th class="num">R²</th><th class="num">ρ</th><th class="num">≤2x</th></tr></thead><tbody>';
     F.wf.folds.forEach(function (f) { h += '<tr><td>' + f.from + ' → ' + f.to + '</td><td class="num">' + f.train_n + '/' + f.test_n + '</td><td class="num ' + (f.metrics.r2 > 0 ? 'win' : 'lose') + '">' + f.metrics.r2 + '</td><td class="num">' + f.metrics.rho + '</td><td class="num">' + f.metrics.within_2x_pct + '%</td></tr>'; });
     h += '<tr class="hi"><td>Pooled out-of-time</td><td class="num">—/' + pm.n + '</td><td class="num ' + (pm.r2 > 0 ? 'win' : 'lose') + '">' + pm.r2 + '</td><td class="num">' + pm.rho + '</td><td class="num">' + pm.within_2x_pct + '%</td></tr></tbody></table>' +
@@ -350,7 +358,7 @@
   // ------------------------------------------------------------ detail view
 
   function drawerHtml(r) {
-    var ev = evOf(r), im = impliedOf(r.x), br = bridgeOf(r.x), pr = evOf(r, 1);
+    var ev = evOf(r), im = impliedOf(r), br = bridgeOf(r), pr = evOf(r, 1);
     var q10 = Math.round(r.implied_value_usd * Math.exp(F.loo.resid_q10)), q90 = Math.round(r.implied_value_usd * Math.exp(F.loo.resid_q90));
     var h = '<button class="x" aria-label="Close">close ✕</button><div class="dh"><h2>' + esc(r.name) + ' ' + seg(r) + '</h2><div class="dsub"><b>rank #' + r.rank + '</b> of ' + K.board + ' by implied FDV · ' + esc(r.slug) + ' · ' + esc(r.category) + ' · ' + esc(r.chains.slice(0, 4).join(', ')) + (r.chains.length > 4 ? ' +' + (r.chains.length - 4) : '') + ' · TVL ' + usd(r.tvl_usd) + ' · 7d ' + growth(r.change_7d) + ' · ' + age(r.age_days) + ' tracked, no token recorded</div></div>';
     h += '<div class="dk">' + pill(r.verdict, 'lg') + ev.t.map(function (x, i) { return '<span><span class="lab">Net EV at $' + x.d.toLocaleString('en-US') + '</span><span class="big ' + (i ? (x.pct >= 0 ? 'v-farm' : 'v-skip') : vc(r.verdict)) + '">' + pct(x.pct, 2) + '</span></span>'; }).join('') +
@@ -358,7 +366,7 @@
     h += '<div class="dsec"><h4>Valuation — what the model claims</h4><div class="vband"><span class="o" style="left:' + at(q10) + '%;width:' + (at(q90) - at(q10)).toFixed(1) + '%"></span>' + rangeBar(r).replace('class="rb"', 'class="rb big"') + '</div>' +
       '<div class="vl"><span>Q10 ' + usd(q10) + '</span><span>Q25–Q75 <b>' + usd(r.implied_low_usd) + ' – ' + usd(r.implied_high_usd) + '</b></span><span>Q90 ' + usd(q90) + '</span></div>' +
       '<table class="ev"><tbody><tr><td>Typical traded comp, exp(ȳ)</td><td class="num">' + usd(Math.exp(F.ybar)) + '</td></tr>';
-    [['TVL ' + usd(r.tvl_usd), br[0]], ['7-day momentum ' + pct(r.change_7d), br[1]], ['Time tracked with no token, ' + age(r.age_days), br[2]], ['Breadth, ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's'), br[3]], ['Category, ' + esc(r.category), br[4]]].forEach(function (b) {
+    [['TVL ' + usd(r.tvl_usd), br[0]], ['Breadth, ' + r.chains.length + ' chain' + (r.chains.length === 1 ? '' : 's'), br[1]], ['Category, ' + esc(r.category), br[2]], ['7-day TVL growth ' + pct(r.change_7d) + (Math.abs(r.change_7d) > M.growth_cap_pct ? ', capped ±' + M.growth_cap_pct + '%' : ''), br[3]], ['Seasoning, ' + age(r.age_days) + ' with no token', br[4]]].forEach(function (b) {
       h += '<tr><td>× ' + b[0] + '</td><td class="num ' + (b[1] >= 0 ? 'win' : 'lose') + '">×' + Math.exp(b[1]).toFixed(3) + '</td></tr>';
     });
     h += '<tr class="tot"><td>= Implied FDV (' + x2(r.fitted_multiple) + ' TVL)</td><td class="num">' + usd(im) + '</td></tr></tbody></table></div>';
@@ -371,12 +379,13 @@
       tr('Gas, ' + M.tx_count + ' tx on ' + esc(f.chains_farmed.join(' + ')), function () { return ev.gas; }, 1) + tr('Bridge allowance', function () { return M.bridge_usd; }, 1) +
       tr('Carry ' + M.opportunity_cost_annum * 100 + '%/yr × ' + ev.hold + 'd', function (x) { return x.op; }, 1) +
       '<tr class="tot"><td>Net expected return</td>' + ev.t.map(function (x) { return '<td class="num ' + (x.net >= 0 ? 'win' : 'lose') + '">' + (x.net >= 0 ? '+' : '') + money(x.net) + '<br><small>' + pct(x.pct, 2) + '</small></td>'; }).join('') + '</tr>' +
+      '<tr><td>Break-even deposit</td><td class="num" colspan="3"><b>' + (ev.be === null ? 'none: drop yield ' + ev.gross + '% < carry' : '$' + ev.be.toLocaleString('en-US')) + '</b></td></tr>' +
       '<tr><td class="sub">Pure pro-rata (capture 1x)</td>' + pr.t.map(function (x) { return '<td class="num sub">' + pct(x.pct, 2) + '</td>'; }).join('') + '</tr></tbody></table>';
-    h += '<div class="recompute' + (im === r.implied_value_usd && ev.ok && ev.verdict === r.verdict ? '' : ' off') + '">page recompute: exp(' + F.ybar + ' + Σ β·z) = $' + im.toLocaleString('en-US') + ' · board $' + r.implied_value_usd.toLocaleString('en-US') + (im === r.implied_value_usd ? ' ✓' : ' ✗') +
+    h += '<div class="recompute' + (im === r.implied_value_usd && ev.ok && ev.verdict === r.verdict ? '' : ' off') + '">page recompute: exp(' + F.ybar + ' + Σ β·z ' + (br[3] + br[4] >= 0 ? '+ ' : '− ') + Math.abs(br[3] + br[4]).toFixed(4) + ' record) = $' + im.toLocaleString('en-US') + ' · board' + (im === r.implied_value_usd ? ' ✓' : ' ✗ $' + r.implied_value_usd.toLocaleString('en-US')) +
       '\nfarm: ' + ev.t.map(function (x) { return pct(x.pct, 2) + ' @' + x.d / 1000 + 'k'; }).join(' / ') + ' → ' + ev.verdict + (ev.ok && ev.verdict === r.verdict ? ' ✓ matches board' : ' ✗ board ' + r.verdict) + '</div></div></div>';
     h += '<div><div class="dsec"><h4>The plan — six steps, each with cost and time</h4><ol class="plan">';
     r.steps.forEach(function (s, i) { h += '<li><span class="st">' + (i + 1) + '</span><span class="sa">' + esc(s.action) + '</span><span class="ct"><b>Cost</b> ' + esc(s.cost) + ' <b>Time</b> ' + esc(s.time) + '</span></li>'; });
-    h += '</ol></div><div class="dsec"><h4>Risk, plainly</h4><p>Pre-token farming is venture-sized: a young ' + esc(r.category) + ' protocol can lose the deposit to a bug, a depeg or an admin key, and a points programme can change, dilute or never drop. Every dollar here is the model’s claim, never a promise; DefiLlama records no token for it, which is not proof it has none.</p></div></div></div>';
+    h += '</ol></div><div class="dsec"><h4>Risk, plainly</h4><p>Pre-token farming is venture-sized: ' + (r.age_days !== null && r.age_days >= 365 ? 'even a ' + age(r.age_days) + '-old ' : 'a young ') + esc(r.category) + ' protocol can lose the deposit to a bug, a depeg or an admin key, and a points programme can change, dilute or never drop. Every dollar here is the model’s claim, never a promise; DefiLlama records no token for it, which is not proof it has none.</p></div></div></div>';
     return h;
   }
   function openDrawer(rank) {
@@ -417,7 +426,7 @@
   }
   function render() {
     var tabs = [['board', 'Board', K.board], ['radar', 'Radar', K.board], ['comps', 'Tokenized', D.live.length], ['aside', 'Set-aside', D.aside.length], ['model', 'Methodology', '']];
-    var h = '<header class="mast"><div><h1><span class="kestrel">KESTREL</span> <span class="thinw">Token Launch Radar</span></h1><p class="tag">Which pre-token protocol to farm next: every protocol on the sealed DefiLlama snapshot, priced by a ridge regression on ' + K.comps + ' traded comps (TVL, 7d momentum, time with no token, breadth, category) and netted to a deposit-sized FARM / THIN / SKIP verdict.</p></div>' +
+    var h = '<header class="mast"><div><h1><span class="kestrel">KESTREL</span> <span class="thinw">Token Launch Radar</span></h1><p class="tag">Which pre-token protocol to farm next: every protocol on the sealed DefiLlama snapshot, priced from its own TVL, 7-day growth and time with no token by a ridge fitted on ' + K.comps + ' traded comps, and netted to a deposit-sized FARM / THIN / SKIP verdict.</p></div>' +
       '<div class="meta"><b>' + D.model_version + '</b> · snapshot ' + D.as_of + '<br>' + K.total + ' protocols → ' + K.pre_token + ' record no token → ' + K.board + ' ranked</div></header>';
     h += kpis() + '<nav class="tabs" role="tablist" aria-label="Views">' + tabs.map(function (t) {
       return '<button role="tab" data-v="' + t[0] + '" aria-selected="' + (state.view === t[0]) + '">' + t[1] + ' <span class="cnt">' + t[2] + '</span></button>';

@@ -134,6 +134,7 @@ ok('cross: sum implied matches', data.kpis.total_implied_usd === rows.reduce((n,
 const bySlug = new Map(rows.map((r) => [r.slug, r]));
 let stepMismatch = 0, implMismatch = 0, evMismatch = 0, verdictMismatch = 0;
 const F = data.fit, MD = data.model, GS = data.gas_usd;
+let monoBad = 0;
 const rnd = (n, dp) => { const f = 10 ** dp; return Math.round(n * f) / f; };
 for (const d of data.rows) {
   const b = bySlug.get(d.slug);
@@ -142,9 +143,13 @@ for (const d of data.rows) {
   if (JSON.stringify(rebuilt) !== JSON.stringify(b.farm_steps)) stepMismatch++;
   // the page's implied: exp of the rounded-feature dot product with the shipped coefficients
   const logv = d.x.reduce((acc, v, j) => acc + F.beta[j] * ((v - F.mu[j]) / F.sd[j]), F.ybar);
-  if (Math.max(1, Math.round(Math.exp(logv))) !== b.implied_value_usd) implMismatch++;
+  // plus the record offset: growth (clamped 7d) and seasoning (time with no token)
+  const g = (MD.growth_elasticity * Math.min(MD.growth_cap_pct, Math.max(-MD.growth_cap_pct, d.change_7d ?? 0))) / 100;
+  const sea = Math.log(1 - MD.season_depth * Math.exp(-(d.age_days ?? MD.unknown_age_days) / MD.season_days));
+  if (Math.max(1, Math.round(Math.exp(logv + (g + sea)))) !== b.implied_value_usd) implMismatch++;
+  if ((d.change_7d ?? 0) < 0 && g >= 0) monoBad++;
   // the page's farm EV: the same rounded pipeline as lib/model.ts
-  const farmed = [...d.chains].sort().slice(0, 2);
+  const farmed = d.chains.slice(0, 1);
   const gas = rnd(MD.tx_count * farmed.reduce((a, c) => a + (GS[c] ?? MD.gas_default_usd), 0), 2);
   let hold = d.age_days === null ? MD.hold_unknown_days : MD.hold_default_days;
   if (d.age_days !== null) for (const [cap, dy] of MD.hold_by_age_days) if (d.age_days < cap) { hold = dy; break; }
@@ -157,6 +162,7 @@ for (const d of data.rows) {
   if (verdict !== b.verdict) verdictMismatch++;
 }
 ok('cross: data.js farm steps rebuild board.json steps 100%', stepMismatch === 0, `${stepMismatch} mismatches`);
+ok('cross: a falling 7d TVL never raises a value', monoBad === 0, `${monoBad} rows`);
 ok('cross: page recomputation yields board implied for every row', implMismatch === 0, `${implMismatch} mismatches`);
 ok('cross: farm EV recomputes to the shipped dollars for every row', evMismatch === 0, `${evMismatch} mismatches`);
 ok('cross: FARM/THIN/SKIP verdicts recompute for every row', verdictMismatch === 0, `${verdictMismatch} mismatches`);

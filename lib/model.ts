@@ -1,18 +1,19 @@
-// Kestrel Token Radar: the fitted valuation model and the board builder (kestrel-4).
+// Kestrel Token Radar: the fitted valuation model and the board builder (kestrel-5).
 //
 // One sealed snapshot in, one ranked board out.
 //
 // The value model is NOT a hand-picked median multiple. It fits a real log-linear ridge regression
 // on the snapshot's own tokenized protocols:
 //
-//   log(mcap_usd) ~ log(tvl_usd) + category_fixed_effects + change_7d + log(age_days) + log(chains)
+//   log(mcap_usd) ~ log(tvl_usd) + log(chains) + category_fixed_effects + offset(record)
+//
+// where the record offset is g*change_7d (clamped) + log(1 - d*exp(-age/T)): see recordLog.
 //
 // - comps        every tokenized protocol (mcap recorded) at or above COMP_MIN_USD of TVL and mcap:
 //                this snapshot's 87. No protocol name is special-cased; the design matrix is built
 //                from the ten snapshot fields alone.
-// - features     log(tvl); momentum change_7d clipped to [MOM_FLOOR, MOM_CAP]/100; log(age+1) with
-//                age = days from listed_at to as_of (UNKNOWN_AGE_DAYS when unlisted); log(chains);
-//                category fixed effects for every category holding CAT_MIN_COMPS+ comps (anything
+// - features     log(tvl); log(chains); 7-day growth and seasoning (age = days from listed_at to
+//                as_of, UNKNOWN_AGE_DAYS when unlisted) enter as the fixed record offset; category fixed effects for every category holding CAT_MIN_COMPS+ comps (anything
 //                else loads on the baseline intercept).
 // - target       log(mcap), winsorized at [WINSOR_LO, WINSOR_HI] quantiles for the FIT only; every
 //                error metric below is measured against the actual, unwinsorized log(mcap).
@@ -80,8 +81,10 @@ export interface ModelConstants {
   lam_noise_grid: number[];
   lam_category_grid: number[];
   cat_min_comps: number;
-  momentum_floor_pct: number;
-  momentum_cap_pct: number;
+  growth_cap_pct: number;
+  growth_elasticity: number;
+  season_depth: number;
+  season_days: number;
   unknown_age_days: number;
   tx_count: number;
   bridge_usd: number;
@@ -108,8 +111,10 @@ export const MODEL: ModelConstants = {
   lam_noise_grid: [10, 30, 100, 300],
   lam_category_grid: [0.3, 1, 3, 10],
   cat_min_comps: 6,
-  momentum_floor_pct: -60,
-  momentum_cap_pct: 150,
+  growth_cap_pct: 30,
+  growth_elasticity: 0.75,
+  season_depth: 0.35,
+  season_days: 180,
   unknown_age_days: 270,
   tx_count: 12,
   bridge_usd: 6,
@@ -138,7 +143,7 @@ export const GAS_USD: Record<string, number> = {
 };
 
 /** The model's version label: the dashboard names it, the board carries it. */
-export const MODEL_VERSION = 'kestrel-4';
+export const MODEL_VERSION = 'kestrel-5';
 
 // ---------------------------------------------------------------- basics
 
@@ -366,6 +371,7 @@ export interface FarmEconomics {
   net1k_pct: number;
   net5k_pct: number;
   net25k_pct: number;
+  breakeven_usd: number | null;
   verdict: 'FARM' | 'THIN' | 'SKIP';
 }
 
@@ -549,7 +555,8 @@ function holdDaysFor(age: number | null, model: ModelConstants): number {
  * the sensitivity tiers (fixed costs amortize, carry does not).
  */
 export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string[], age: number | null, model: ModelConstants = MODEL): FarmEconomics {
-  const farmed = [...chains].sort().slice(0, 2);
+  // Gas is paid on the one chain the plan farms: the protocol's first-listed (home) chain.
+  const farmed = chains.slice(0, 1);
   const gas = round(model.tx_count * farmed.reduce((a, c) => a + (GAS_USD[c] ?? model.gas_default_usd), 0), 2);
   const bridge = model.bridge_usd;
   const hold = holdDaysFor(age, model);
@@ -594,6 +601,9 @@ export function farmEconomics(tvlUsd: number, impliedUsd: number, chains: string
     net1k_pct: netPct1,
     net5k_pct: round((100 * n5) / d5, 2),
     net25k_pct: round((100 * n25) / d25, 2),
+    // The deposit at which the mid-band drop first pays the fixed costs back, or null when the
+    // drop yield never beats the carry (then no deposit size breaks even).
+    breakeven_usd: grossPct / 100 > model.opportunity_cost_annum * (hold / 365) ? Math.ceil((gas + bridge) / (grossPct / 100 - model.opportunity_cost_annum * (hold / 365))) : null,
     verdict: netPct1 >= model.farm_net_pct ? 'FARM' : netPct1 >= model.thin_net_pct ? 'THIN' : 'SKIP',
   };
 }
@@ -735,11 +745,15 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
   } else {
     monitor = `Track ${p.name}'s TVL against this snapshot's $${Math.round(p.tvl_usd / 1_000_000)}M print each week; if it falls more than 25% below your entry level, or the protocol ships a token, close the farm and re-read the board.`;
   }
-  const verdictWord = farm.verdict === 'FARM' ? 'clears the FARM bar at $1,000' : farm.verdict === 'THIN' ? 'is THIN at $1,000: it pays only at the $5,000 size or with cheaper execution' : 'is a SKIP at $1,000: its model EV does not clear gas, bridge and lock-up';
+  const be = farm.breakeven_usd === null
+    ? `no deposit size breaks even, because the ${farm.gross_mid_pct}% drop yield is below the ${round((100 * MODEL.opportunity_cost_annum * farm.hold_days) / 365, 2)}% carry`
+    : `it breaks even from a $${farm.breakeven_usd.toLocaleString('en-US')} deposit`;
+  const verdictWord = farm.verdict === 'FARM' ? `it clears the ${MODEL.farm_net_pct}% FARM bar at $1,000 and ${be}` : farm.verdict === 'THIN' ? `it pays, but under the ${MODEL.farm_net_pct}% FARM bar; ${be}` : `do not open a wallet for the drop alone: ${be}`;
+  const ageWord = age === null ? 'an undated' : age < 365 ? `a ${Math.max(1, Math.round(age / 30))}-month-old` : `a ${(age / 365).toFixed(1)}-year-old`;
   return [
     {
       action: `Open a dedicated farming wallet for this position only (a fresh seed phrase, stored offline) and fund it with $1,000 of USDC plus the ${chain} gas token. $1,000 is the size this ${farm.verdict} verdict is computed at; the same plan nets ${sgn(farm.net5k_pct)}% at $5,000 and ${sgn(farm.net25k_pct)}% at $25,000, because gas and bridge are fixed costs and only the carry scales.`,
-      cost: `$${farm.cost1k_usd} of hard costs total: ${farm.gas_usd} gas (${MODEL.tx_count} tx on ${farm.chains_farmed.join(' + ')}), ${MODEL.bridge_usd} bridge allowance, ${farm.op1k_usd} lock-up carry`,
+      cost: `$${farm.cost1k_usd} of hard costs total: $${farm.gas_usd} gas (${MODEL.tx_count} tx on ${farm.chains_farmed.join(' + ')}), $${MODEL.bridge_usd} bridge allowance, $${farm.op1k_usd} lock-up carry`,
       time: '15 minutes',
     },
     {
@@ -749,7 +763,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
     },
     {
       action: `Every 5-7 days make one small on-chain action on ${p.name} from the same wallet - a swap, a vault re-balance, a claim-and-restake or a small top-up - so the address reads as a repeat user across the whole ${farm.hold_days}-day window, not a one-shot visitor.`,
-      cost: 'gas on every action, about 2 per week',
+      cost: `about $${round(farm.gas_usd / MODEL.tx_count, 2)} of ${chain} gas per action`,
       time: `10 minutes a week for ${farm.hold_days} days (${weeks} weeks)`,
     },
     { action: monitor, cost: "free to check on the protocol's own stats page", time: '5 minutes a week' },
@@ -759,7 +773,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, farm: FarmEco
       time: '10 minutes when a claim opens',
     },
     {
-      action: `Net the position: costs ${farm.cost1k_usd} dollars against the mid-band expectation leave ${farm.net1k_usd >= 0 ? '+' : ''}${farm.net1k_usd} dollars (${farm.net1k_pct}%) at $1,000 - this row is a ${farm.verdict}: ${verdictWord}. ${core.exit.charAt(0).toUpperCase() + core.exit.slice(1)} on ${chain} when the window closes. Treat the capital as venture-sized: a young ${categoryOf(p)} protocol can lose all of it to a bug or a rogue admin key.`,
+      action: `Net the position: $${farm.cost1k_usd} of costs against the mid-band expectation leave ${farm.net1k_usd >= 0 ? '+' : '-'}$${Math.abs(farm.net1k_usd)} (${sgn(farm.net1k_pct)}%) at $1,000, a ${farm.verdict}: ${verdictWord}. ${core.exit.charAt(0).toUpperCase() + core.exit.slice(1)} on ${chain} when the window closes. Treat the capital as venture-sized: ${ageWord} ${categoryOf(p)} protocol can lose all of it to a bug or a rogue admin key.`,
       cost: `$${farm.cost5k_usd} of hard costs at $5,000 (net ${sgn(farm.net5k_pct)}%), $${farm.cost25k_usd} at $25,000 (net ${sgn(farm.net25k_pct)}%)`,
       time: '20 minutes to unwind',
     },
@@ -777,30 +791,31 @@ export function stepText(step: FarmStep): string {
 // ---------------------------------------------------------------- the fitted model
 
 /** The whole ridge pipeline over the snapshot's comps: fit, LOO, walk-forward, baselines, bands. */
-export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { fit: ModelFit; comps: SnapshotProtocol[]; design: (p: SnapshotProtocol) => number[] } {
+export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { fit: ModelFit; comps: SnapshotProtocol[]; design: (p: SnapshotProtocol) => number[]; offset: (p: SnapshotProtocol) => number } {
   const comps = snapshot.protocols
     .filter((p) => p.mcap_usd !== null && p.mcap_usd >= model.comp_min_usd && p.tvl_usd >= model.comp_min_usd)
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const age = (p: SnapshotProtocol) => ageDays(snapshot.as_of, p.listed_at) ?? model.unknown_age_days;
   const counts = new Map<string, number>();
   for (const c of comps) counts.set(categoryOf(c), (counts.get(categoryOf(c)) ?? 0) + 1);
   const cats = [...counts.entries()].filter(([, n]) => n >= model.cat_min_comps).map(([k]) => k).sort();
-  const featureNames = ['log(tvl_usd)', 'change_7d (clamped /100)', 'log(age_days+1)', 'log(chains)', ...cats.map((c) => `fe:${c}`)];
+  const featureNames = ['log(tvl_usd)', 'log(chains)', ...cats.map((c) => `fe:${c}`)];
   const design = (p: SnapshotProtocol): number[] => [
     Math.log(p.tvl_usd),
-    clamp(p.change_7d ?? 0, model.momentum_floor_pct, model.momentum_cap_pct) / 100,
-    Math.log(age(p) + 1),
     Math.log(Math.max(1, p.chains.length)),
     ...cats.map((c) => (categoryOf(p) === c ? 1 : 0)),
   ];
+  // The record terms enter as a fixed offset (the GLM sense): the ridge fits the level on what is
+  // left once 7-day growth and seasoning are priced at their stated elasticities.
+  const offset = (p: SnapshotProtocol): number => recordLog(p.change_7d, ageDays(snapshot.as_of, p.listed_at), model).total;
   const F = comps.map(design);
   const Y0 = comps.map((c) => Math.log(c.mcap_usd!));
+  const OFF = comps.map(offset);
   const wLo = quantile(Y0, model.winsor_lo);
   const wHi = quantile(Y0, model.winsor_hi);
-  const Yw = Y0.map((y) => clamp(y, wLo, wHi));
+  const Yw = Y0.map((y, i) => clamp(y, wLo, wHi) - OFF[i]!);
   const idx = comps.map((_, i) => i);
   const meanActual = Y0.reduce((a, b) => a + b, 0) / Y0.length;
-  const pen = (t: number, nz: number, lc: number) => [t, nz, nz, nz, ...cats.map(() => lc)];
+  const pen = (t: number, nz: number, lc: number) => [t, nz, ...cats.map(() => lc)];
 
   // The penalty triple that maximizes leave-one-out R2 on the rows of `train` alone. Every caller
   // passes only the rows it may see: the full fit all 87, a nested fold 86, a walk-forward fold its past.
@@ -809,7 +824,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     const mean = ac.reduce((a, b) => a + b, 0) / ac.length;
     let best: { lam: [number, number, number]; r2: number } | null = null;
     for (const t of model.lam_size_grid) for (const nz of model.lam_noise_grid) for (const lc of model.lam_category_grid) {
-      const pr = train.map((i) => ridgeFit(F, Yw, train.filter((j) => j !== i), pen(t, nz, lc)).predict(F[i]!));
+      const pr = train.map((i) => ridgeFit(F, Yw, train.filter((j) => j !== i), pen(t, nz, lc)).predict(F[i]!) + OFF[i]!);
       const r2 = r2Of(pr, ac, mean);
       if (best === null || r2 > best.r2) best = { lam: [t, nz, lc], r2 };
     }
@@ -825,13 +840,13 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     const train = idx.filter((j) => j !== i);
     const l = selectLam(train);
     nestedLam.push(l.join('/'));
-    return ridgeFit(F, Yw, train, pen(l[0], l[1], l[2])).predict(F[i]!);
+    return ridgeFit(F, Yw, train, pen(l[0], l[1], l[2])).predict(F[i]!) + OFF[i]!;
   });
   const nestedM = metrics(nestedPred, Y0, meanActual);
   const nestedSame = nestedLam.filter((l) => l === lam.join('/')).length;
 
   // Full LOO pass at the selected lambdas: metrics, signed residuals, scatter points.
-  const looPred = idx.map((i) => ridgeFit(F, Yw, idx.filter((j) => j !== i), pen(lam[0], lam[1], lam[2])).predict(F[i]!));
+  const looPred = idx.map((i) => ridgeFit(F, Yw, idx.filter((j) => j !== i), pen(lam[0], lam[1], lam[2])).predict(F[i]!) + OFF[i]!);
   const looResid = looPred.map((p, i) => round(p - Y0[i]!, 4));
   const looM = metrics(looPred, Y0, meanActual);
 
@@ -851,7 +866,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     const test = chunks[f + 1]!;
     const sel = { lam: selectLam(train) };
     const mf = ridgeFit(F, Yw, train, pen(sel.lam[0], sel.lam[1], sel.lam[2]));
-    const pr = test.map((i) => mf.predict(F[i]!));
+    const pr = test.map((i) => mf.predict(F[i]!) + OFF[i]!);
     const ac = test.map((i) => Y0[i]!);
     pooledPred.push(...pr);
     pooledAc.push(...ac);
@@ -886,8 +901,12 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     globalPr.push(Math.log(comps[i]!.tvl_usd * peerMedian));
   }
   // TVL alone: log(mcap) on log(tvl) by OLS, the same LOO pass - what the other terms add.
-  const tvlOnly = idx.map((i) => ridgeFit(F.map((r) => [r[0]!]), Yw, idx.filter((j) => j !== i), [0]).predict([F[i]![0]!]));
+  const Yraw = Y0.map((y) => clamp(y, wLo, wHi));
+  const tvlOnly = idx.map((i) => ridgeFit(F.map((r) => [r[0]!]), Yraw, idx.filter((j) => j !== i), [0]).predict([F[i]![0]!]));
+  // The same ridge with the record terms dropped: what pricing growth and seasoning costs or buys.
+  const noRecord = idx.map((i) => ridgeFit(F, Yraw, idx.filter((j) => j !== i), pen(lam[0], lam[1], lam[2])).predict(F[i]!));
   const baselines = [
+    { name: 'same ridge, no growth or seasoning terms', note: 'the identical level fit with the record offset set to zero', metrics: metrics(noRecord, Y0, meanActual) },
     { name: 'log-log on TVL alone (OLS)', note: 'log(mcap) = a + b*log(tvl), no category, momentum, age or breadth terms', metrics: metrics(tvlOnly, Y0, meanActual) },
     { name: 'shrink-median FDV/TVL (hand-calibrated multiples)', note: 'category median of comp FDV/TVL ratios clamped to [0.1, 3] and shrunk to the market median by w = n/(n+4): the hand-set constant this radar replaces', metrics: metrics(shrinkPr, Y0, meanActual) },
     { name: 'category median multiple (no shrinkage)', note: 'each comp priced at its own category LOO median FDV/TVL multiple', metrics: metrics(globalPr, Y0, meanActual) },
@@ -903,7 +922,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
   }));
 
   const fit: ModelFit = {
-    equation: 'log(mcap_usd) = b0 + b1*log(tvl_usd) + b2*chg7d + b3*log(age_days+1) + b4*log(chains) + sum(fe_category)',
+    equation: 'log(mcap_usd) = b0 + b1*log(tvl_usd) + b2*log(chains) + sum(fe_category) + g*chg7d + log(1 - d*exp(-age/T))',
     target: `log(mcap), winsorized p${model.winsor_lo * 100}-p${model.winsor_hi * 100} for the fit; every error metric measures the actual, unwinsorized log(mcap)`,
     n_comps: comps.length,
     lam,
@@ -916,7 +935,7 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     beta: fitRidge.beta.map((v) => round(v, 4)),
     feature_names: featureNames,
     elasticity_at_mean: round(fitRidge.beta[0]! / fitRidge.sd[0]!, 4),
-    in_sample_r2: metrics(idx.map((i) => fitRidge.predict(F[i]!)), Y0, meanActual).r2,
+    in_sample_r2: metrics(idx.map((i) => fitRidge.predict(F[i]!) + OFF[i]!), Y0, meanActual).r2,
     nested: { metrics: nestedM, same_lam: nestedSame },
     loo: {
       metrics: looM,
@@ -929,7 +948,19 @@ export function fitModel(snapshot: Snapshot, model: ModelConstants = MODEL): { f
     loo_points: looPoints,
     baselines,
   };
-  return { fit, comps, design };
+  return { fit, comps, design, offset };
+}
+
+/**
+ * The record terms, in log space. Growth: g x the 7-day TVL change clamped to +-GROWTH_CAP_PCT
+ * (+10% -> x1.078 at g 0.75; a falling TVL always lowers the value). Seasoning: TVL that has
+ * stayed with no token for longer is stickier, so a young protocol keeps 1 - d*exp(-age/T) of its
+ * level (d 0.35, T 180 days: 30 days -> x0.70, 1 year -> x0.95). Unlisted protocols take UNKNOWN_AGE_DAYS.
+ */
+export function recordLog(change7d: number | null, age: number | null, model: ModelConstants = MODEL): { growth: number; season: number; total: number } {
+  const growth = (model.growth_elasticity * clamp(change7d ?? 0, -model.growth_cap_pct, model.growth_cap_pct)) / 100;
+  const season = Math.log(1 - model.season_depth * Math.exp(-(age ?? model.unknown_age_days) / model.season_days));
+  return { growth, season, total: growth + season };
 }
 
 /** Named anchor comps for one scored row: same category first, then size-similar protocol comps;
@@ -952,11 +983,11 @@ function anchorsFor(p: SnapshotProtocol, comps: SnapshotProtocol[], n: number): 
 
 /** The board and the dashboard's data, built from one snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { fit, comps, design } = fitModel(snapshot, model);
+  const { fit, comps, design, offset } = fitModel(snapshot, model);
   // Predictions for shipped rows use the SAME rounded coefficients and rounded features the page
   // will recompute from: exp(ybar + Σ beta_j (x_j - mu_j)/sd_j) reproduces the board to the dollar.
   const predictX = (x: number[]) => x.reduce((acc, v, j) => acc + fit.beta[j]! * ((v - fit.mu[j]!) / fit.sd[j]!), fit.ybar);
-  const predictLog = (p: SnapshotProtocol) => predictX(design(p).map((v) => round(v, 4)));
+  const predictLog = (p: SnapshotProtocol) => predictX(design(p).map((v) => round(v, 4))) + offset(p);
   const watchSet = new Set(snapshot.watchlist);
   const band = fit.loo;
 
@@ -1003,7 +1034,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const scored = chosen
     .map((p) => {
       const x = design(p).map((v) => round(v, 4));
-      const implied = Math.max(1, Math.round(Math.exp(predictX(x))));
+      const implied = Math.max(1, Math.round(Math.exp(predictX(x) + offset(p))));
       const age = ageDays(snapshot.as_of, p.listed_at);
       const farm = farmEconomics(p.tvl_usd, implied, p.chains, age, model);
       const steps = farmSteps(p, age, farm);
