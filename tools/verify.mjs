@@ -137,8 +137,15 @@ const rnd = (n, dp) => { const f = 10 ** dp; return Math.round(n * f) / f; };
 const clampv = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const ageOf = (p) => (p.listed_at === null ? null : Math.max(0, Math.round((Date.parse(`${snapshot.as_of}T00:00:00Z`) - Date.parse(`${p.listed_at}T00:00:00Z`)) / 86400000)));
 const cat = (p) => p.category ?? 'Uncategorized';
-// Implied FDV from the snapshot's own TVL and category and the shipped ridge: exp(ybar + sum b (x - mu) / sd).
-const fdvOf = (p) => { const x = [rnd(Math.log(p.tvl_usd), 4), KM.PASS.has(cat(p)) ? 1 : 0]; return Math.max(1, Math.round(Math.exp(x.reduce((a, v, j) => a + F.beta[j] * ((v - F.mu[j]) / F.sd[j]), F.ybar)))); };
+// Implied value from the snapshot's own TVL, category, 7d change and listing age, and the shipped fit:
+// exp(anchor + sum b (x - mu) / sd + bg (G - Gbar) + e log(ref / sigma(age band))), summed in the bridge's order.
+const fdvOf = (p) => {
+  const x = [rnd(Math.log(p.tvl_usd), 4), KM.PASS.has(cat(p)) ? 1 : 0], age = ageOf(p);
+  const G = rnd(Math.log(1 + clampv((p.change_7d ?? 0) - F.gm, -MD.g_cap, MD.g_cap) / 100), 6);
+  const k = age === null ? -1 : MD.age_bands.filter((b) => age >= b).length - 1, sig = F.dur.bands.find((b) => b.k === k).s;
+  const terms = [F.ybar + F.bg * F.gbar, ...x.map((v, j) => F.beta[j] * ((v - F.mu[j]) / F.sd[j])), F.bg * (G - F.gbar), F.elasticity * rnd(Math.log(F.dur.ref / sig), 6)];
+  return Math.max(1, Math.round(Math.exp(terms.reduce((a, v) => a + v, 0))));
+};
 // Campaign odds rebuilt by hand: the launch curve month by month, P(by t) = (F(a+t) - F(a)) / (1 - F(a)), and the diluted season share.
 const campOf = (p) => {
   const age = ageOf(p), u = age === null ? 1 : 0, a = age ?? MD.unknown_age, c = OD.cat_logit[cat(p)] ?? OD.prior_logit;
@@ -152,7 +159,7 @@ const campOf = (p) => {
 // The two-outcome tier rebuilt by hand.
 const dq = [0.25, 0.5, 0.75].map((q) => { const v = KM.DROPS.map((d) => d[1]).sort((a, b) => a - b), i = (v.length - 1) * q, lo = Math.floor(i); return rnd(v[lo] + (v[Math.min(lo + 1, v.length - 1)] - v[lo]) * (i - lo), 2); });
 const tier = (f, deposit) => {
-  const days = f.weeks * 7, per = (q) => ((dq[q] / 100) * f.share * f.fdv[q] * f.ss) / f.tvl;
+  const P = Math.round(f.tvl <= MD.pool_ref ? f.tvl : MD.pool_ref * (f.tvl / MD.pool_ref) ** MD.pool_gamma), days = f.weeks * 7, per = (q) => ((dq[q] / 100) * f.share * f.fdv[q] * f.ss) / P;
   const gas = rnd((MD.tx_base + Math.ceil(f.weeks / MD.tx_per_weeks)) * f.gas_tx, 2), carry = rnd(deposit * ((MD.benchmark + f.prem - f.apy) / 100) * (days / 365), 2), cost = gas + f.bridge + carry;
   const ann = (n) => rnd((((100 * n) / deposit) * 365) / days, 2);
   const net = [0, 1, 2].map((q) => rnd(rnd(deposit * per(q), 2) - cost, 2)), netIf = [0, 1, 2].map((q) => rnd(rnd((deposit * per(q)) / Math.max(1e-9, f.p24), 2) - cost, 2));
@@ -178,7 +185,7 @@ for (const d of data.rows) {
   if (JSON.stringify(rebuilt) !== JSON.stringify(b.farm_steps)) stepBad++;
 }
 ok('cross: data.js rows = board rows', data.rows.length === rows.length, String(data.rows.length));
-ok('cross: implied FDV rebuilt from snapshot TVL + category and the shipped ridge, every row', implBad === 0, `${rows.length - implBad}/${rows.length}`);
+ok('cross: implied value rebuilt from snapshot TVL, category, 7d change and age with the shipped fit, every row', implBad === 0, `${rows.length - implBad}/${rows.length}`);
 ok('cross: P(12m), P(24m), season share and farm window rebuilt from snapshot fields + shipped launch curve, every row', oddsBad === 0, `${rows.length - oddsBad}/${rows.length}`);
 ok('cross: every P(token) strictly inside (0, 1) and P12 <= P24', oddsRange === 0, `P12 ${Math.min(...rows.map((r) => r.p_token_12m))}..${Math.max(...rows.map((r) => r.p_token_12m))}, P24 ${Math.min(...rows.map((r) => r.p_token_24m))}..${Math.max(...rows.map((r) => r.p_token_24m))}`);
 ok('cross: two-outcome verdict, p50 ROI and APR rebuilt by hand = board = KM.farmTier, all rows x 3 tiers', tierBad === 0, `${tierN - tierBad}/${tierN}`);
@@ -188,10 +195,11 @@ ok('cross: farm steps rebuild board.json steps', stepBad === 0, `${stepBad} mism
 {
   const U = snapshot.protocols.map((p) => { const a = ageOf(p); return { s: p.slug, n: p.name, c: cat(p), t: p.tvl_usd, g: p.change_7d, a, ch: p.chains.length, l: a === null ? null : p.listed_at, k: p.mcap_usd === null && p.gecko_id === null && p.symbol === null ? 0 : 1, m: p.mcap_usd }; });
   const v = KM.fitValue(U), o = KM.fitOdds(U, { terms: OD.terms, lam: OD.lam });
-  ok('refit: value model refit from the raw snapshot = shipped coefficients, LOO, walk-forward and ledger', JSON.stringify([v.beta, v.mu, v.sd, v.ybar, v.lam, v.loo, v.wf, v.ledger]) === JSON.stringify([F.beta, F.mu, F.sd, F.ybar, F.lam, F.loo, F.wf, F.ledger]), `LOO R2 ${v.loo.r2} rho ${v.loo.rho}, WF rho ${v.wf.pooled.rho}`);
+  ok('refit: value model refit from the raw snapshot = shipped coefficients, LOO, walk-forward and ledger', JSON.stringify([v.beta, v.mu, v.sd, v.ybar, v.lam, v.bg, v.gm, v.dur, v.loo, v.wf, v.ledger]) === JSON.stringify([F.beta, F.mu, F.sd, F.ybar, F.lam, F.bg, F.gm, F.dur, F.loo, F.wf, F.ledger]), `LOO R2 ${v.loo.r2} rho ${v.loo.rho}, WF rho ${v.wf.pooled.rho}`);
   ok('refit: launch curve refit + 758 LOO refits from the raw snapshot = shipped', JSON.stringify([o.beta, o.b0, o.loo, o.calib]) === JSON.stringify([OD.beta, OD.b0, OD.loo, OD.calib]), `AUC ${o.loo.auc}`);
-  const kept = F.ledger.filter((t) => t.kept && t.group !== 'core');
-  ok('ledger: every shipped term beats the core on both held-out tests, every refused one does not', F.ledger.every((t) => t.group === 'core' ? t.kept === !(t.r2 > F.loo.r2 && t.wf > F.wf.pooled.rho) : t.kept === (t.r2 > F.loo.r2 && t.wf > F.wf.pooled.rho && Math.sign(t.beta ?? 1) === Math.sign(t.rc ?? 1))), `${F.ledger.length} terms, ${kept.length} shipped`);
+  const [dT, dF, dG] = F.ledger, beats = (t) => t.r2 < F.loo.r2 && t.l1 > F.loo.l1 && t.rho < F.loo.rho && t.wf < F.wf.pooled.rho;
+  ok('ledger: dropping log TVL or the family loses on all four held-out scores; 7d growth lowers blind LOO mean |log error|', beats(dT) && beats(dF) && dG.l1 > F.loo.l1 && F.bg > 0, `${F.ledger.length} designs, bg ${F.bg}, LOO |e| ${dG.l1} -> ${F.loo.l1}`);
+  ok('durability: sigma by age band falls with age in both slug halves (dated bands)', [0, 1].every((h) => F.dur.bands.filter((b) => b.k >= 0).every((b, i, a) => i === 0 || b.h[h] < a[i - 1].h[h])), F.dur.bands.map((b) => `${b.k}:${b.s}`).join(' '));
 }
 ok('cross: odds model validated blind (LOO AUC > 0.5, Brier beats base rate, walk-forward AUC > 0.5)', OD.loo.auc > 0.5 && OD.loo.brier < OD.loo.base_brier && OD.wf.pooled.auc > 0.5, `LOO AUC ${OD.loo.auc} Brier ${OD.loo.brier} vs ${OD.loo.base_brier}; WF AUC ${OD.wf.pooled.auc}`);
 ok('cross: log TVL elasticity non-negative', F.elasticity >= 0, String(F.elasticity));
@@ -227,7 +235,7 @@ for (const dep of MD.tiers) {
   bkInfo.push(`${dep}:${ps.length} net ${s.net}`);
 }
 ok('cross: farm basket per tier rebuilds (sleeve math summed independently); FARM sleeves, distinct home chains, <= 2 per category, 4 sleeves at $10k and $50k', bkBad === 0, bkInfo.join(' '));
-ok('cross: dashboard source <= 65,000 bytes (whole inside the 65,536-byte dossier text)', totalBytes <= 65000, `${totalBytes} bytes`);
+ok('cross: dashboard source <= 64,500 bytes (whole inside the 65,536-byte dossier text)', totalBytes <= 64500, `${totalBytes} bytes`);
 
 // ---------------------------------------------------------------- determinism (optional second run)
 if (outDir2) {

@@ -68,7 +68,7 @@ OVERLAP_JS = """() => { const out = []; let n = 0;
     for (let i = 0; i < b.length; i++) for (let j = i + 1; j < b.length; j++) { const p = b[i][1], q = b[j][1];
       if (p.left < q.right && q.left < p.right && p.top < q.bottom && q.top < p.bottom) out.push(b[i][0] + ' / ' + b[j][0]); } }
   return { n, out }; }"""
-CLIP = ".kpi b, .kpi span, .grid td b, .grid td small, .dk b, .dk small, .dk label, h3, ol.bkl b, .bkk label, .bkk small, .stats label, .stats small, .acc small, .hb span, .strip, .led td"
+CLIP = ".kpi b, .kpi span, .grid td b, .grid td small, .fx i, .dk b, .dk small, .dk label, h3, ol.bkl b, .bkk label, .bkk small, .stats label, .stats small, .acc small, .hb span, .strip, .led td"
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(executable_path="/usr/bin/google-chrome", args=["--no-sandbox", "--disable-dev-shm-usage", "--force-device-scale-factor=1"])
@@ -107,7 +107,7 @@ with sync_playwright() as pw:
     # ---- integrity strip, computed by the page: accounting, live rows and both live refits
     strip = page.evaluate("() => document.querySelector('.strip').textContent")
     check("integrity strip: 758/758, 40/40, all rows live, value fit + ledger and launch curve re-run = shipped",
-          "758/758" in strip and "40/40" in strip and f"{N}/{N}" in strip and "ledger" in strip and "758 LOO refits" in strip and "✗" not in strip, strip.strip()[:200])
+          "758/758" in strip and "40/40" in strip and f"{N}/{N}" in strip and "4-term value fit" in strip and "758 LOO refits" in strip and "✗" not in strip, strip.strip()[:200])
 
     # ---- every tier: the page's numbers equal board.json's for all rows
     for tier in (1000, 10000, 50000):
@@ -160,8 +160,12 @@ with sync_playwright() as pw:
     no_overlap("shot 01")
     shot("01-board-overview.png")
 
-    # ---- 02 detail drawer of the best setup
-    page.click(".side ol.bkl li >> nth=0")
+    # ---- 02 detail drawer of the best watchlist FARM at $10k (else the best setup)
+    pick = page.evaluate("() => { const w = R.rows.filter(r => r.seg === 'W' && T(r).verdict === 'FARM').sort((a, b) => T(b).apr[1] - T(a).apr[1]); return w.length ? w[0].slug : null; }")
+    if pick:
+        page.evaluate("(s) => openDrawer(s)", pick)
+    else:
+        page.click(".side ol.bkl li >> nth=0")
     page.wait_for_timeout(400)
     st = page.evaluate("""() => { const d = document.getElementById('drawer'), st = d.querySelectorAll('ol.plan li');
       return {open: d.classList.contains('open'), name: d.querySelector('h2').textContent, pill: d.querySelector('.dk .pill').textContent,
@@ -197,7 +201,7 @@ with sync_playwright() as pw:
     page.wait_for_timeout(300)
     st = page.evaluate("() => ({loo: document.querySelectorAll('.mgrid circle.in, .mgrid circle.out').length, cal: document.querySelectorAll('.mgrid circle.cal').length, led: document.querySelectorAll('.led tr').length - 1, acc: document.querySelectorAll('.acc div').length, vis: [...document.querySelectorAll('.mgrid > section')].map(s => Math.round(s.getBoundingClientRect().bottom))})")
     check("shot 04: 87 blind LOO points and 5 calibration quintiles", st["loo"] == 87 and st["cal"] == 5, st)
-    check("shot 04: term ledger shows the core plus every tested term", st["led"] == 1 + len(json.loads(page.evaluate("() => JSON.stringify(F.ledger)"))), st["led"])
+    check("shot 04: term ledger shows the shipped design plus every tested one", st["led"] == 1 + len(json.loads(page.evaluate("() => JSON.stringify(F.ledger)"))), st["led"])
     check("shot 04: 6-bucket 758 accounting", st["acc"] == 6, st["acc"])
     check("shot 04: all three methodology panels end above the fold", all(v <= H for v in st["vis"]), st["vis"])
     layout("shot 04")

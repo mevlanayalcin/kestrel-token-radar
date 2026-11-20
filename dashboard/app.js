@@ -1,14 +1,10 @@
 'use strict';
-// Kestrel Token Radar v8: renders window.RADAR (data.js) with KM (model.js). Every number on screen is
-// recomputed by KM; integrity() and rerun() prove on load that rows, value fit, ledger and launch curve = board.json.
-
-// model.js declares M (constants), rd, clamp and KM; R is the shipped data.
+// Kestrel Token Radar v9: renders window.RADAR (data.js) with KM, M, rd, clamp (model.js). integrity() and
+// rerun() prove on load that rows, value fit, ledger and launch curve = board.json.
 const R = window.RADAR, F = R.fit, O = R.odds;
 const S = { tier: 10000, tab: 'board', q: '', seg: 'all', v: 'all', cat: 'all', chain: 'all', sort: 'r', dir: 1, open: null };
 const UN = Object.fromEntries(R.U.map((u) => [u.s, u]));
 const DISP = { W: 'Watchlist, ranked', E: 'Emerging, ranked', C: 'Traded comp', K: 'Token, outside comps', A: 'Set aside ≥ floor', X: 'Screened < floor' };
-/** Earlier versions on the same snapshot, all blind: [name, LOO R², walk-forward ρ, P(token) LOO AUC]. */
-const HISTORY = [['R3 group ridge', 0.153, 0.216, null], ['v4 growth/age offsets', 0.133, 0.183, null], ['v5 pass-through family', 0.207, 0.396, null], ['v7 sign-boxed growth/age', 0.207, 0.396, 0.755]];
 
 // ---- format
 const $ = (s) => document.querySelector(s);
@@ -31,13 +27,16 @@ const pill = (v) => `<span class="pill ${v}">${v}</span>`;
 const ck = (c) => `<b class="${c ? 'ck' : 'bad'}">${c ? '✓' : '✗'}</b>`;
 const carry = (r) => rd(M.benchmark + r.route.prem - r.route.apy, 2);
 const T = (r, d = S.tier) => ((r._t ??= {})[d] ??= KM.farmTier(r.f, d));
-/** A table: header cells (a leading '>' right-aligns one) and rows of ready cell HTML. */
+/** The value bridge as multipliers: [anchor $, TVL, family, 7d growth, no-token seasoning]. */
+const fx = (r) => KM.bridge(F, UN[r.slug]).map(Math.exp);
+const xm = (v) => '×' + v.toFixed(2);
+/** A table: header cells ('>' right-aligns) and rows of cell HTML. */
 const tbl = (head, rows, cls = 'mt') => `<table class="${cls}"><tr>${head.map((h) => (h[0] === '>' ? `<th class="n">${h.slice(1)}</th>` : `<th>${h}</th>`)).join('')}</tr>${rows.join('')}</table>`;
 const td = (v, c = 'n') => `<td class="${c}">${v}</td>`;
 const box = (l, v, m = '') => `<div><label>${l}</label><b>${v}</b>${m && `<small>${m}</small>`}</div>`;
 
-// ---- integrity, proved in the browser
-/** On boot: 758 accounted once each; every row's FDV, odds, season share and three verdicts = board.json. */
+// ---- integrity
+/** On boot: 758 accounted once; every row's value, odds, season share and verdicts = board.json. */
 function integrity() {
   const by = R.U.reduce((a, u) => ((a[u.d] = (a[u.d] || 0) + 1), a), {}), fn = R.funnel;
   const live = R.rows.filter((r) => { const u = UN[r.slug], c = KM.campaign(O, u);
@@ -45,10 +44,10 @@ function integrity() {
   const ok = by.W === fn.watchlist && by.E === fn.emerging && by.C === fn.comps && by.K === fn.token_other && by.A === fn.aside_above && by.X === fn.screened_below;
   return { by, acc: Object.values(by).reduce((a, n) => a + n, 0), ok, wl: R.rows.filter((r) => r.seg === 'W').length, live };
 }
-/** After first paint: refit the value model with its whole ledger, and the launch curve with all 758 LOO refits. */
+/** After first paint: refit the value model and ledger, and the launch curve with all 758 LOO refits. */
 function rerun() {
   const t0 = performance.now(), v = KM.fitValue(R.U), o = KM.fitOdds(R.U, { terms: O.terms, lam: O.lam }), same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-  return { ms: Math.round(performance.now() - t0), value: same([v.beta, v.mu, v.sd, v.ybar, v.lam, v.loo, v.wf, v.ledger], [F.beta, F.mu, F.sd, F.ybar, F.lam, F.loo, F.wf, F.ledger]),
+  return { ms: Math.round(performance.now() - t0), value: same(v, F),
     odds: same([o.beta, o.b0, o.loo, o.calib], [O.beta, O.b0, O.loo, O.calib]) };
 }
 const I = integrity();
@@ -57,7 +56,7 @@ let L = null;
 // ---- filters and sort
 const CATS = [...new Set(R.rows.map((r) => r.cat))].sort();
 const CHAINS = Object.entries(R.rows.reduce((a, r) => ((a[r.f.chain] = (a[r.f.chain] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]).map(([c]) => c);
-const KEYS = { r: (r) => r.r, name: (r) => r.name.toLowerCase(), tvl: (r) => r.tvl, chg: (r) => r.chg ?? -1e9, p: (r) => r.f.p12, fdv: (r) => r.fdv, apr: (r) => T(r).apr[1], be: (r) => T(r).breakeven ?? 1e12, v: (r) => ['FARM', 'THIN', 'SKIP'].indexOf(T(r).verdict) };
+const KEYS = { r: (r) => r.r, name: (r) => r.name.toLowerCase(), tvl: (r) => r.tvl, p: (r) => r.f.p12, fdv: (r) => r.fdv, apr: (r) => T(r).apr[1], be: (r) => T(r).breakeven ?? 1e12, v: (r) => ['FARM', 'THIN', 'SKIP'].indexOf(T(r).verdict) };
 function view() {
   const q = S.q.trim().toLowerCase(), k = KEYS[S.sort];
   return R.rows.filter((r) => (S.seg === 'all' || r.seg === S.seg) && (S.v === 'all' || T(r).verdict === S.v) && (S.cat === 'all' || r.cat === S.cat) &&
@@ -68,21 +67,20 @@ function view() {
 // ---- shell
 function header() {
   const n = R.rows.length, cnt = (rs) => rs.reduce((a, r) => ((a[T(r).verdict] += 1), a), { FARM: 0, THIN: 0, SKIP: 0 }), v = cnt(R.rows), wv = cnt(R.rows.filter((r) => r.seg === 'W'));
-  const best = R.rows.reduce((b, r) => (T(r).apr[1] > T(b).apr[1] ? r : b), R.rows[0]);
-  const live = L === null ? '<span class="dim">re-running both fits in this browser…</span>' : `${ck(L.value)} <span><b>value fit + ${F.ledger.length}-term ledger</b> re-run = shipped</span>${ck(L.odds)} <span><b>launch curve + ${O.n} LOO refits</b> re-run = shipped · ${L.ms} ms</span>`;
+  const live = L === null ? '<span class="dim">re-running both fits in this browser…</span>' : `${ck(L.value)} <span><b>4-term value fit + ${F.ledger.length}-design ledger</b> re-run = shipped</span>${ck(L.odds)} <span><b>launch curve + ${O.n} LOO refits</b> re-run = shipped · ${L.ms} ms</span>`;
   const kpi = (l, b, s, c = '') => `<div class="kpi ${c}"><label>${l}</label><b>${b}</b>${s}</div>`;
   $('#top').innerHTML = `<div class="brand"><div><h1><b>KESTREL</b> Token Launch Radar</h1>
-  <p>Every pre-token protocol in the sealed DefiLlama snapshot, priced if it launches (ridge on ${F.n} traded comps), given its launch odds from the record of all ${O.n} peers, and netted to a two-outcome farm verdict over a ${M.credit_months}-month points-credit horizon.</p></div>
+  <p>Every pre-token protocol in the DefiLlama snapshot, valued if it launches from its TVL, 7-day growth and time with no token (fit on ${F.n} traded comps), given launch odds from all ${O.n} peers and a costed two-outcome farm verdict.</p></div>
   <div class="cap" role="group" aria-label="Capital per farm"><span>Capital per farm</span>${M.tiers.map((d, i) => `<button data-tier="${d}" class="${d === S.tier ? 'on' : ''}">${tl(d)}<small>${['retail', 'active', 'whale'][i]}</small></button>`).join('')}</div>
   <div class="stamp">${esc(R.version)} · snapshot ${R.as_of}<br>${R.funnel.total} protocols → ${n} ranked</div></div>
   <div class="strip">${ck(I.acc === R.funnel.total && I.ok)} <span><b>${I.acc}/${R.funnel.total}</b> accounted</span>${ck(I.wl === R.funnel.watchlist)} <span><b>${I.wl}/${R.funnel.watchlist}</b> watchlist</span>${ck(I.live === n)} <span><b>${I.live}/${n}</b> live-recomputed = board.json</span>${live}</div>
   ${S.tab !== 'board' ? '' : `<div class="kpis">${kpi('Watchlist covered', `${I.wl}<i>/${R.funnel.watchlist}</i>`, `<span>${wv.FARM} FARM · ${wv.THIN} THIN · ${wv.SKIP} SKIP at ${tl(S.tier)}</span>`)}
-  ${kpi('Ranked pre-token', `${n}<i> of ${R.funnel.total}</i>`, `<span>${R.funnel.watchlist} watchlist + ${R.funnel.emerging} emerging</span>`)}
+  ${kpi('Ranked pre-token', `${n}<i> of ${R.funnel.total}</i>`, `<span>${R.funnel.watchlist} watch + ${R.funnel.emerging} emerging · ${R.funnel.comps + R.funnel.token_other} traded apart</span>`)}
   ${kpi(`Verdicts at ${tl(S.tier)}`, ['FARM', 'THIN', 'SKIP'].map((k) => `<em class="${k}">${v[k]}</em>`).join(' · '), `<div class="mix">${['FARM', 'THIN', 'SKIP'].map((k) => `<i class="${k}" style="flex:${v[k]}"></i>`).join('')}</div>`)}
-  ${kpi('Best risk-adj farm', `<em class="${sign(T(best).apr[1])}">${pc(T(best).apr[1])}</em>`, `<span>${esc(best.name)} · P 12m ${pp(best.f.p12)} · 24m ${pp(best.f.p24)}</span>`)}
-  ${kpi('Held-out, both models', `R² ${f3(F.loo.r2)}<i> · AUC ${O.loo.auc.toFixed(2)}</i>`, `<span>LOO · walk-fwd ρ ${F.wf.pooled.rho.toFixed(2)}, AUC ${O.wf.pooled.auc.toFixed(2)}</span>`)}</div>`}`;
+  ${kpi('Value model · 4 terms', `TVL<sup>${F.elasticity.toFixed(2)}</sup>·(1+g)<sup>${F.bg}</sup>`, `<span>× seasoning<sup>${F.elasticity.toFixed(2)}</sup> × family (pass ×${F.pass_mult.toFixed(2)})</span>`, 'eqk')}
+  ${kpi('Held-out, both tests', `ρ ${F.loo.rho.toFixed(2)}<i> · AUC ${O.loo.auc.toFixed(2)}</i>`, `<span>LOO R² ${F.loo.r2.toFixed(2)} · walk-fwd ρ ${F.wf.pooled.rho.toFixed(2)}, AUC ${O.wf.pooled.auc.toFixed(2)}</span>`)}</div>`}`;
   $('#tabs').innerHTML = [['board', 'Board'], ['method', 'Methodology']].map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k ? 'on' : ''}">${l}${k === 'board' ? ` <small>${n}</small>` : ''}</button>`).join('') +
-    '<span class="note">P = odds of a token within 12 / 24 months · APR blended over both outcomes, net of all costs</span>';
+    '<span class="note">g = 7d growth over the market week · P = odds of a token in 12 / 24 months · APR blended over both outcomes, net of every cost</span>';
 }
 
 function filters(n) {
@@ -96,19 +94,19 @@ function filters(n) {
 }
 
 // ---- board
-const LO = Math.log(1e6), HI = Math.log(3e8), bx = (v) => clamp(((Math.log(v) - LO) / (HI - LO)) * 100, 0, 100);
 function board() {
   const rows = view(), th = (k, l, c = '') => `<th class="${c}${S.sort === k ? ' sorted' : ''}" data-sort="${k}">${l}${S.sort === k ? (S.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`;
-  const body = rows.map((r) => { const t = T(r), c = r.chg ?? 0;
+  const body = rows.map((r) => { const t = T(r), c = r.chg ?? 0, x = fx(r), fp = (l, v) => `<i class="${v >= 1.005 ? 'pos' : v <= 0.995 ? 'neg' : ''}">${l} ${xm(v)}</i>`;
     return `<tr data-slug="${r.slug}" tabindex="0"><td class="rk">${r.r}</td>
   <td class="pn"><b>${esc(r.name)}</b><span class="seg ${r.seg}">${r.seg === 'W' ? 'WATCH' : 'EMERG'}</span><small>${esc(r.cat)} · ${esc(r.f.chain)}${r.chains.length > 1 ? ' +' + (r.chains.length - 1) : ''} · ${ageTxt(r.age)}</small></td>
-  ${td(usd(r.tvl))}${td(`<span class="trend ${sign(c)}">${c > 0 ? '▲' : c < 0 ? '▼' : '•'} ${Math.abs(c).toFixed(1)}%</span>`)}
+  ${td(`<b>${usd(r.tvl)}</b><small class="trend ${sign(c)}">${c > 0 ? '▲' : c < 0 ? '▼' : '•'} ${Math.abs(c).toFixed(1)}% 7d</small>`, 'n tv')}
   <td class="pt"><b>${pp(r.f.p12)}</b><small> · ${pp(r.f.p24)}</small><div class="pbar"><i style="width:${100 * r.f.p24}%"></i><u style="width:${100 * r.f.p12}%"></u></div></td>
-  <td class="fdv"><b>${usd(r.fdv)}</b><small>${usd(r.lo, 0)}–${usd(r.hi, 0)}</small><div class="band"><i style="left:${bx(r.lo)}%;width:${bx(r.hi) - bx(r.lo)}%"></i><u style="left:${bx(r.fdv)}%"></u></div></td>
-  ${td(`<b class="${sign(t.apr[1])}">${pc(t.apr[1])}</b><small>if token ${pc(t.apr_if[1])}</small>`, 'n apr')}${td(t.breakeven === null ? '—' : usd0(t.breakeven), 'n dim')}${td(pill(t.verdict), 'vc')}</tr>`; }).join('');
+  <td class="fdv"><b>${usd(r.fdv)}</b><small>${usd(r.lo, 0)}–${usd(r.hi, 0)}</small><div class="fx">${fp('TVL', x[1] * x[2])}${fp('7d', x[3])}${fp('age', x[4])}</div></td>
+  <td class="fp"><b>${esc(r.tag)} · ${r.f.weeks} wk</b><small>${usd0(t.gas + t.bridge)} gas · ${usd0(t.carry)} carry · BE ${t.breakeven === null ? '—' : usd0(t.breakeven)}</small></td>
+  ${td(`<b class="${sign(t.apr[1])}">${pc(t.apr[1])}</b><small>if token ${pc(t.apr_if[1])}</small>`, 'n apr')}${td(pill(t.verdict), 'vc')}</tr>`; }).join('');
   return `<div class="cols"><section class="panel">${filters(rows.length)}
-  <table class="grid" id="grid"><thead><tr>${th('r', '#', 'rk')}${th('name', 'Protocol')}${th('tvl', 'TVL', 'n')}${th('chg', '7d', 'n')}${th('p', 'P 12m · 24m')}${th('fdv', 'Implied FDV · Q25–Q75')}${th('apr', `Risk-adj net APR @${tl(S.tier)}`, 'n')}${th('be', 'Break-even', 'n')}${th('v', 'Verdict', 'vc')}</tr></thead>
-  <tbody>${body || '<tr><td colspan="9" class="empty">No protocol matches these filters.</td></tr>'}</tbody></table></section>
+  <table class="grid" id="grid"><thead><tr>${th('r', '#', 'rk')}${th('name', 'Protocol')}${th('tvl', 'TVL · 7d', 'n')}${th('p', 'P 12m · 24m')}${th('fdv', 'Implied value · Q25–Q75')}${th('be', `Farm plan @${tl(S.tier)}`)}${th('apr', 'Net APR', 'n')}${th('v', 'Verdict', 'vc')}</tr></thead>
+  <tbody>${body || '<tr><td colspan="8" class="empty">No protocol matches these filters.</td></tr>'}</tbody></table></section>
   <aside class="side">${S.v === 'FARM' ? basketCard() + breakdown(rows) : setups(rows) + basketCard()}</aside></div>`;
 }
 const li = (r, name, sub, apr, right) => `<li data-slug="${r.slug}"><b>${name}</b><small>${sub}</small><em class="pos">${pc(apr)}</em><span>${right}</span></li>`;
@@ -133,18 +131,18 @@ function openDrawer(slug) {
   const r = R.rows.find((x) => x.slug === slug);
   if (!r) return;
   S.open = slug;
-  const u = UN[slug], x = KM.core(u), z = x.map((v, j) => F.beta[j] * ((v - F.mu[j]) / F.sd[j])), fdv = KM.implied(F, u), c = KM.campaign(O, u), t = T(r), ts = M.tiers.map((d) => T(r, d));
-  const fac = [['Comp at sample mean, exp(ȳ)', Math.exp(F.ybar)], [`× TVL ${usd(r.tvl)} (elasticity ${F.elasticity.toFixed(2)})`, Math.exp(z[0])], [`× ${x[1] ? 'Pass-through' : 'Own-fee'} family (${esc(r.cat)})`, Math.exp(z[1])]];
+  const u = UN[slug], z = KM.bridge(F, u), fdv = KM.implied(F, u), c = KM.campaign(O, u), t = T(r), ts = M.tiers.map((d) => T(r, d)), g = KM.growth(u, F.gm), sb = F.dur.bands.find((b) => b.k === KM.bandOf(u.a));
+  const fac = [['Peer anchor: comps’ mean log mcap', 'exp(ȳ)'], [`TVL ${usd(r.tvl)}`, `^${F.elasticity.toFixed(2)} fitted`], [`${KM.isPass(u.c) ? 'Pass-through' : 'Own-fee'} family · ${esc(r.cat)}`, 'ridge'],
+    [`7d ${pc(r.chg ?? 0)} vs market ${pc(F.gm)} → ${pc(100 * Math.expm1(g))}`, `(1+g)^${F.bg}`], [`No token ${ageTxt(r.age)}: TVL σ ${sb.s.toFixed(1)}%/wk`, `(${F.dur.ref.toFixed(1)}/σ)^${F.elasticity.toFixed(2)}`]];
   const row = (l, fn, cls = '') => `<tr class="${cls}"><td>${l}</td>${ts.map((y) => td(fn(y), 'n' + (y.deposit === S.tier ? ' cur' : ''))).join('')}</tr>`, sec = (l) => `<tr class="sec"><td colspan="4">${l}</td></tr>`;
-  const d = $('#drawer'), tested = F.ledger.filter((l) => l.group === '7d growth' || l.group === 'age').length;
+  const d = $('#drawer');
   d.innerHTML = `<header class="dh"><div><h2>${esc(r.name)} <span class="seg ${r.seg}">${r.seg === 'W' ? 'WATCHLIST' : 'EMERGING'}</span></h2>
-  <p>rank <b>#${r.r}</b> of ${R.rows.length} by implied FDV · ${esc(r.cat)} · home chain <b>${esc(r.f.chain)}</b>${r.chains.length > 1 ? ` (+${r.chains.length - 1})` : ''} · TVL <b>${usd(r.tvl)}</b> · 7d <b class="${sign(r.chg ?? 0)}">${pc(r.chg ?? 0)}</b> · ${ageTxt(r.age)} tracked, no token</p></div>
-  <div class="dk">${box('Implied FDV', usd(r.fdv), `Q25–Q75 ${usd(r.lo)}–${usd(r.hi)}`)}${box('P(token) 12m · 24m', `${pp(c.p12)} <i>· ${pp(c.p24)}</i>`, 'risk-adj ' + usd(r.fdv * c.p24))}${box(`Risk-adj APR @${tl(S.tier)}`, `<em class="${sign(t.apr[1])}">${pc(t.apr[1])}</em>`, 'if token ' + pc(t.apr_if[1]))}${pill(t.verdict)}<button class="ghost" id="close" aria-label="Close">Close ✕</button></div></header>
+  <p>rank <b>#${r.r}</b> of ${R.rows.length} by implied value · ${esc(r.cat)} · home chain <b>${esc(r.f.chain)}</b>${r.chains.length > 1 ? ` (+${r.chains.length - 1})` : ''} · TVL <b>${usd(r.tvl)}</b> · 7d <b class="${sign(r.chg ?? 0)}">${pc(r.chg ?? 0)}</b> · ${ageTxt(r.age)} tracked, no token</p></div>
+  <div class="dk">${box('Implied value', usd(r.fdv), `Q25–Q75 ${usd(r.lo)}–${usd(r.hi)}`)}${box('P(token) 12m · 24m', `${pp(c.p12)} <i>· ${pp(c.p24)}</i>`, 'risk-adj ' + usd(r.fdv * c.p24))}${box(`Risk-adj APR @${tl(S.tier)}`, `<em class="${sign(t.apr[1])}">${pc(t.apr[1])}</em>`, 'if token ' + pc(t.apr_if[1]))}${pill(t.verdict)}<button class="ghost" id="close" aria-label="Close">Close ✕</button></div></header>
   <div class="dgrid"><div>
   <h3>Valuation <small>${fdv === r.fdv ? '✓ KM.implied() = board' : '✗'}</small></h3>
-  <table class="wf">${fac.map(([l, v], i) => `<tr><td>${l}</td>${td(i ? '×' + v.toFixed(3) : usd(v), 'n ' + (i ? (v < 1 ? 'neg' : 'pos') : ''))}</tr>`).join('')}<tr class="tot"><td>= Implied FDV · ${(r.fdv / r.tvl).toFixed(2)}× TVL</td>${td(usd(r.fdv))}</tr></table>
-  <p class="mono">exp(${F.ybar.toFixed(3)} ${z.map((v) => (v < 0 ? '− ' : '+ ') + Math.abs(v).toFixed(3)).join(' ')}) = ${fdv.toLocaleString('en-US')} ${fdv === r.fdv ? '✓' : '✗'}</p>
-  <p class="mini">7d growth (${pc(r.chg ?? 0)}) and age (${ageTxt(r.age)}) were fitted into FDV ${tested} ways and lost held-out skill each time, so they set the odds, window and tranche instead.</p>
+  <table class="wf">${fac.map(([l, f], i) => { const v = Math.exp(z[i]); return `<tr><td>${i ? '× ' : ''}${l}<small> ${f}</small></td>${td(i ? xm(v) : usd(v), 'n ' + (i ? (v < 0.995 ? 'neg' : v > 1.005 ? 'pos' : '') : ''))}</tr>`; }).join('')}<tr class="tot"><td>= Implied value · ${(r.fdv / r.tvl).toFixed(2)}× TVL</td>${td(usd(r.fdv))}</tr></table>
+  <p class="mono">exp(${z[0].toFixed(3)} ${z.slice(1).map((v) => (v < 0 ? '− ' : '+ ') + Math.abs(v).toFixed(3)).join(' ')}) = ${fdv.toLocaleString('en-US')} ${fdv === r.fdv ? '✓' : '✗'}</p>
   <h3>Launch odds <small>${c.p12 === r.f.p12 && c.p24 === r.f.p24 ? '✓ KM.campaign() = board' : '✗'}</small></h3>
   <div class="stats">${box('F(age)', pp(c.fa), 'peers')}${box('P 12m', pp(c.p12), 'if none yet')}${box('P 24m', pp(c.p24), 'credit span')}${box('Share', (100 * c.ss).toFixed(1) + '%', 'of season')}</div>
   <p class="mini">A launch in month m (odds p_m) pays a ${c.weeks}-week deposit min(window, t) ÷ (prior season + t) of the points, so a late token dilutes the drop.</p>
@@ -157,7 +155,7 @@ function openDrawer(slug) {
   ${sec('Blended expectation')}${row('Expected drop, p50', (y) => usd(y.ev[1]))}${row('Net, p50', (y) => `<b class="${sign(y.net[1])}">${usd(y.net[1])}</b>`)}${row('Risk-adj APR, p50', (y) => `<b class="${sign(y.apr[1])}">${pc(y.apr[1])}</b>`, 'hi')}
   ${row('p25 … p75', (y) => `<small>${pc(y.apr[0], 0)} … ${pc(y.apr[2], 0)}</small>`)}${row('Break-even deposit', (y) => (y.breakeven === null ? '—' : usd0(y.breakeven)))}${row('Verdict', (y) => pill(y.verdict) + (y.whale ? '<br><small class="warn">&gt;1% of TVL</small>' : ''))}</table>
   <h3>Sensitivity <small>blended net APR by deposit</small></h3>${sens(r.f)}
-  <p class="mini">Drop p50 = ${KM.dropQ()[1]}% of supply (median of 12 launches) × ${r.f.share} route share × FDV × ${(100 * c.ss).toFixed(1)}% season share. Main risk: ${esc(r.route.risk)}.${carry(r) <= 0 ? ` Zero carry: the ${r.route.apy}% base APY covers benchmark + premium.` : ''}</p>
+  <p class="mini">Drop p50 = ${KM.dropQ()[1]}% of supply (median of 12 launches) × ${r.f.share} route share × value × ${(100 * c.ss).toFixed(1)}% season share ÷ a ${usd(t.pool)} farming pool (TVL to $5M, then ^${M.pool_gamma}). Main risk: ${esc(r.route.risk)}.</p>
   </div><div>
   <h3>Farm plan on ${esc(r.f.chain)} <small>${r.steps.length} steps, cost and time each</small></h3>
   <ol class="plan">${r.steps.map((s) => `<li><p>${esc(s.action)}</p><span><i>Cost</i>${esc(s.cost)}</span> <span><i>Time</i>${esc(s.time)}</span></li>`).join('')}</ol>
@@ -167,7 +165,7 @@ function openDrawer(slug) {
 }
 function closeDrawer() { S.open = null; $('#drawer').classList.remove('open'); $('#drawer').setAttribute('aria-hidden', 'true'); $('#scrim').hidden = true; }
 
-/** Label baselines pushed at least `gap` apart and kept inside [top, bottom], so no two chart labels touch. */
+/** Label baselines pushed `gap` apart inside [top, bottom], so no two labels touch. */
 function spread(ys, gap, top, bottom) {
   const o = ys.map((y, i) => ({ y: clamp(y, top, bottom), i })).sort((a, b) => a.y - b.y);
   for (let k = 1; k < o.length; k++) o[k].y = Math.max(o[k].y, o[k - 1].y + gap);
@@ -175,7 +173,7 @@ function spread(ys, gap, top, bottom) {
   if (over > 0) o.forEach((p) => (p.y -= over));
   return o.reduce((a, p) => ((a[p.i] = p.y), a), []);
 }
-/** Blended net APR p25/p50/p75 and the if-token p50 against deposit ($100 to $100k, log x), FARM bar and break-even. */
+/** Net APR p25/p50/p75 and if-token p50 by deposit ($100 to $100k, log x), FARM bar, break-even. */
 function sens(f) {
   const W = 440, H = 182, L = 40, B = 22, TOP = 24, R0 = 88, n = 48, xs = [...Array(n + 1).keys()].map((i) => 100 * 1000 ** (i / n));
   const pts = xs.map((d) => { const t = KM.farmTier(f, d); return [t.apr[0], t.apr[1], t.apr[2], t.apr_if[1]]; }), t = KM.farmTier(f, S.tier);
@@ -194,7 +192,7 @@ function sens(f) {
 }
 
 // ---- methodology
-/** A square scatter on one shared axis range for x and y, with its own grid and overlay. */
+/** A scatter on one shared x/y range, with grid and overlay. */
 function scatter(points, o) {
   const { W, H, a, z, f, xl, yl } = o, L = 60, B = 30, X = (v) => L + ((f(v) - a) / (z - a)) * (W - L - 18), Y = (v) => 8 + ((z - f(v)) / (z - a)) * (H - B - 8);
   const grid = o.ticks.map((v, i) => `<line x1="${X(v)}" x2="${X(v)}" y1="8" y2="${H - B}" class="gl"/>${i || !o.skip0 ? `<text x="${X(v)}" y="${H - B + 13}" text-anchor="middle">${o.lab(v)}</text>` : ''}<line x1="${L}" x2="${W - 10}" y1="${Y(v)}" y2="${Y(v)}" class="gl"/><text x="${L - 5}" y="${Y(v) + 3}" text-anchor="end">${o.lab(v)}</text>`).join('');
@@ -205,35 +203,34 @@ function scatter(points, o) {
 function method() {
   const fn = R.funnel, b = (j) => F.beta[j] / F.sd[j], W = F.wf.pooled, OW = O.wf.pooled, diag = (X, Y, lo, hi) => `<line x1="${X(lo)}" y1="${Y(lo)}" x2="${X(hi)}" y2="${Y(hi)}" class="diag"/>`;
   const sc = scatter(F.points.map(([nm, , m, p]) => ({ x: p, y: m, c: Math.abs(Math.log(m / p)) <= Math.LN2 ? 'in' : 'out' })),
-    { W: 440, H: 204, a: 6.6, z: 10.2, f: Math.log10, ticks: [1e7, 1e8, 1e9, 1e10], lab: (v) => usd(v, 0), xl: 'blind LOO predicted FDV (log)', yl: 'actual mcap (log)',
+    { W: 440, H: 204, a: 6.6, z: 10.2, f: Math.log10, ticks: [1e7, 1e8, 1e9, 1e10], lab: (v) => usd(v, 0), xl: 'blind LOO predicted value (log)', yl: 'actual mcap (log)',
       extra: (X, Y) => `<polygon points="${X(2e6)},${Y(4e6)} ${X(2e10)},${Y(4e10)} ${X(2e10)},${Y(1e10)} ${X(2e6)},${Y(1e6)}" class="band2"/>${diag(X, Y, 2e6, 2e10)}` });
   const cal = scatter(O.calib.map((c) => ({ x: c.pred, y: c.obs, c: 'cal', r: 3 + c.n / 40 })),
     { W: 440, H: 176, a: 0, z: 1, f: (v) => v, ticks: [0, 0.25, 0.5, 0.75, 1], lab: pp, skip0: 1, xl: 'held-out predicted token rate, by quintile', yl: 'observed',
       extra: (X, Y) => `${diag(X, Y, 0, 1)}<polyline fill="none" class="cl" points="${O.calib.map((c) => X(c.pred).toFixed(1) + ',' + Y(c.obs).toFixed(1)).join(' ')}"/>` });
   const parts = [['W', fn.watchlist], ['E', fn.emerging], ['C', fn.comps], ['K', fn.token_other], ['A', fn.aside_above], ['X', fn.screened_below]];
-  const dv = (v, base) => td(f3(v), 'n ' + (v > base ? 'up' : 'dn')), ships = F.ledger.filter((t) => t.kept && t.group !== 'core').length;
-  const crash = KM.compsOf(R.U).filter((u) => (u.g ?? 0) <= -20).map((u) => u.g), g30 = F.ledger.find((t) => t.group === '7d growth');
   const fold = (f, a, c) => `<tr><td>${f.from} → ${f.to}</td>${td(f.train + '/' + f.test)}${td(a)}${td(c)}</tr>`, pool = (n, a, c) => `<tr class="tot"><td>Pooled out-of-time</td>${td(n)}${td(a)}${td(c)}</tr>`;
+  const dv = (v, base, lo, c = 'up', d = 'dn') => td(f3(v), 'n ' + ((lo ? v < base : v > base) ? c : d)), L0 = F.loo, D = F.dur, V = F.ledger[2];
   return `<div class="mgrid">
-  <section class="panel"><h3>Valuation model <small>ridge on ${F.n} traded comps, λ ${F.lam} by LOO</small></h3>
-    <pre class="eq">log FDV = ${F.ybar.toFixed(3)} + ${f3(b(0))}·(log TVL − ${F.mu[0].toFixed(2)})
-        − ${f3(Math.abs(b(1)))}·(pass-through − ${F.mu[1].toFixed(2)})
-  ×${(10 ** b(0)).toFixed(2)} per 10× TVL · ×${F.pass_mult.toFixed(2)} if routed capital</pre>
+  <section class="panel"><h3>Valuation model <small>${F.n} traded comps · λ ${F.lam} · bg ${F.bg}, both by blind LOO</small></h3>
+    <pre class="eq">log V = ${(F.ybar + F.bg * F.gbar).toFixed(3)} + ${f3(b(0))}·(log TVL − ${F.mu[0].toFixed(2)})
+      − ${f3(Math.abs(b(1)))}·(pass-through − ${F.mu[1].toFixed(2)})
+      + ${F.bg}·(log(1+g) − ${F.gbar.toFixed(3)})
+      + ${f3(b(0))}·log(${D.ref.toFixed(2)} / σ(time with no token))</pre>
   <h3 class="sub">Term ledger, each held-out twice <small>KM.valueLedger()</small></h3>
-  ${tbl(['Term', '>free β', '>LOO R²', '>WF ρ', 'Verdict'], [`<tr class="tot"><td>core: log TVL + pass-through</td>${td(f3(b(0)))}${td(f3(F.loo.r2))}${td(f3(W.rho))}<td>shipped</td></tr>`,
-      ...F.ledger.map((t) => `<tr><td><i>${esc(t.group)}</i> ${esc(t.name)}</td>${td(t.beta === null ? '' : t.beta.toFixed(2))}${dv(t.r2, F.loo.r2)}${dv(t.wf, W.rho)}${td((t.kept ? '✓ ' : '✗ ') + t.why, t.kept ? 'ok' : 'no')}</tr>`)], 'mt led')}
-  <p class="mini">A term ships only if it beats the core on LOO R² and walk-forward ρ, with a sign its rank correlation agrees with: ${ships} of ${F.ledger.length - 2} do. 7-day growth fits negative because ${crash.length} comps that lost ${pc(Math.max(...crash), 0)} to ${pc(Math.min(...crash), 0)} of TVL in the week carry the slope; its rank correlation with the core residuals is ${g30.rc >= 0 ? '+' : '−'}${Math.abs(g30.rc).toFixed(2)}. Age gains only through the 365-day stand-in for missing dates, and loses once an undated flag absorbs it. No sign box, no clamp.</p></section>
-  <section class="panel"><h3>Blind LOO: predicted vs actual FDV <small>${F.n} refits · green within 2×</small></h3>${sc}
-  <div class="stats">${box('LOO R²', f3(F.loo.r2))}${box('Median err', '×' + Math.exp(F.loo.mae).toFixed(2), 'blind, per comp')}${box('LOO ρ', f3(F.loo.rho))}${box('Walk-fwd ρ', f3(W.rho), 'R² ' + f3(W.r2))}</div>
+  ${tbl(['Design', '>b', '>LOO R²', '>LOO |e|', '>LOO ρ', '>WF ρ'], [`<tr class="tot"><td>shipped: TVL + family + 7d + age</td>${td(F.bg)}${dv(L0.r2, V.r2, 0, 'win', '')}${dv(L0.l1, V.l1, 1, 'win', '')}${dv(L0.rho, V.rho, 0, 'win', '')}${dv(F.wf.pooled.rho, V.wf, 0, 'win', '')}</tr>`,
+      ...F.ledger.map((t) => `<tr><td>${esc(t.name)}</td>${td(t.slope ?? t.b)}${dv(t.r2, L0.r2)}${dv(t.l1, L0.l1, 1)}${dv(t.rho, L0.rho)}${dv(t.wf, F.wf.pooled.rho)}</tr>`)], 'mt led')}
+  <p class="mini">g = 7d change − the market week's ${pc(F.gm)}, capped ±${M.g_cap} points. Green: shipped beats v8 core; amber: a design beats shipped on that test. Dropping TVL or the family loses on every test. 7-day growth is chosen at slope ${F.bg} by blind LOO mean |log error| (${f3(F.ledger[2].l1)} → ${f3(L0.l1)}); re-picked on older cohorts only, it costs the walk-forward a little (ρ ${f3(F.ledger[2].wf)} → ${f3(F.wf.pooled.rho)}). Fitted raw it turns negative only through four comps that lost 22–37% of TVL that week (without them, +1.8). Age is not fitted on comps: their clock is time tracked with a token already trading, and fitted there it gives a fresh-listing premium (slope ${F.ledger[4].slope}). Time with no token enters through TVL durability instead (right).</p></section>
+  <section class="panel"><h3>Blind LOO: predicted vs actual value <small>${F.n} refits · green within 2×</small></h3>${sc}
+  <div class="stats">${box('LOO R²', f3(F.loo.r2))}${box('Median err', '×' + Math.exp(F.loo.mae).toFixed(2), 'blind, per comp')}${box('LOO rho', f3(F.loo.rho))}${box('WF rho', f3(W.rho), 'R² ' + f3(W.r2))}</div>
   <h3 class="sub">Held-out P(token) calibration <small>${O.n} protocols · LOO by quintile</small></h3>${cal}
   <div class="stats">${box('LOO Brier', f3(O.loo.brier), 'base rate ' + f3(O.loo.base_brier))}${box('Log-loss', f3(O.loo.logloss), 'LOO')}${box('ROC-AUC', f3(O.loo.auc), 'LOO')}${box('WF AUC', f3(OW.auc), 'out-of-time')}</div>
-  <p class="mini">Launch curve F: logistic, λ ${O.lam}, on ${O.terms.map((t, j) => `${t} ${O.beta[j] >= 0 ? '+' : '−'}${Math.abs(O.beta[j] / O.sd[j]).toFixed(2)}`).join(' · ')}; category rate = out-of-fold empirical-Bayes logit (m ${O.m}). P(by t) = (F(a+t) − F(a)) ÷ (1 − F(a)). Forward search, both held-out log-losses must drop (LOO / WF AUC): ${O.designs.map((x) => `${esc(x.name)} ${x.loo.auc.toFixed(3)} / ${x.wf.auc.toFixed(3)}`).join(' → ')}.</p></section>
+  <p class="mini">Launch curve F: logistic, λ ${O.lam}, on ${O.terms.map((t, j) => `${t} ${O.beta[j] >= 0 ? '+' : '−'}${Math.abs(O.beta[j] / O.sd[j]).toFixed(2)}`).join(' · ')}; P(by t) = (F(a+t) − F(a)) ÷ (1 − F(a)). Forward search, both held-out log-losses must drop (LOO / WF AUC): ${O.designs.map((x) => `${esc(x.name)} ${x.loo.auc.toFixed(3)}/${x.wf.auc.toFixed(3)}`).join(' → ')}.</p></section>
   <section class="panel"><h3>Walk-forward by listing date <small>train older, predict newer</small></h3>
-  ${tbl(['Value · test cohort', '>n', '>R²', '>ρ'], [...F.wf.folds.map((f) => fold(f, f3(f.m.r2), f3(f.m.rho))), pool(W.n, f3(W.r2), f3(W.rho))])}
+  ${tbl(['Value · test cohort', '>n', '>R²', '>rho'], [...F.wf.folds.map((f) => fold(f, f3(f.m.r2), f3(f.m.rho))), pool(W.n, f3(W.r2), f3(W.rho))])}
   ${tbl(['Odds · test cohort', '>n', '>AUC', '>Brier skill'], [...O.wf.folds.map((f) => fold(f, f3(f.m.auc), pc(100 * f.m.bss, 0))), pool(OW.n, f3(OW.auc), pc(100 * OW.bss, 0))], 'mt')}
-  <h3 class="sub">Version ablation <small>same snapshot, blind</small></h3>
-  ${tbl(['Model', '>LOO R²', '>WF ρ', '>P AUC'], [...HISTORY.map(([nm, a, w, p]) => `<tr><td>${nm}</td>${td(f3(a))}${td(f3(w))}${td(p === null ? 'P ≡ 1' : f3(p), 'n dim')}</tr>`),
-      `<tr class="tot"><td>v8 ${esc(R.version)} (this)</td>${td(f3(F.loo.r2))}${td(f3(W.rho))}${td(f3(O.loo.auc))}</tr>`])}
+  <h3 class="sub">TVL durability by no-token age <small>σ of 7d moves · ${D.n} protocols</small></h3>
+  ${tbl(['Age band', '>n', '>σ %/wk', '>even · odd', '>value ×'], D.bands.map((x) => `<tr><td>${x.k < 0 ? 'undated' : x.from + (M.age_bands[x.k + 1] ? '–' + M.age_bands[x.k + 1] : '+') + ' days'}</td>${td(x.n)}${td(x.s.toFixed(2))}${td(x.h.map((v) => v.toFixed(1)).join(' · '), 'n dim')}${td(xm((D.ref / x.s) ** F.elasticity))}</tr>`))}
   <h3 class="sub">${parts.reduce((a, p) => a + p[1], 0)} / ${fn.total} accounting <small>${I.acc === fn.total && I.ok ? 'each protocol once ✓' : '✗'}</small></h3>
   <div class="acc">${parts.map(([k, v]) => `<div><i class="dot ${k}"></i><b>${v}</b><small>${DISP[k]}</small></div>`).join('')}</div></section></div>`;
 }

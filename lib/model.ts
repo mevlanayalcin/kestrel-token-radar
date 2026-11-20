@@ -1,6 +1,7 @@
-// Kestrel Token Radar (kestrel-9, v8): the board builder around the shared model.
+// Kestrel Token Radar (kestrel-10, v9): the board builder around the shared model.
 //
-// Every number on the board comes from dashboard/model.js (KM): the value fit and its held-out ledger,
+// Every number on the board comes from dashboard/model.js (KM): the four-term value fit (TVL, family, 7-day
+// growth, time with no token) and its held-out ledger,
 // the 758-peer launch curve, the campaign horizon and the two-outcome farm planner. This file loads that
 // exact file (the judge reads it in the dossier, and the page re-runs it live), so there is one copy of
 // the model. What stays here is what the page does not recompute: the snapshot parser, the house product
@@ -42,7 +43,7 @@ export interface FarmTier { deposit: number; txs: number; gas: number; bridge: n
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const KM: any = createRequire(import.meta.url)('../dashboard/model.js');
 export const MODEL = KM.M as Record<string, number> & { tiers: number[] };
-export const MODEL_VERSION = 'kestrel-9';
+export const MODEL_VERSION = 'kestrel-10';
 
 const DAY_MS = 86_400_000;
 export const round = (n: number, dp: number): number => { const f = 10 ** dp; return Math.round(n * f) / f; };
@@ -97,6 +98,9 @@ export function routeOf(category: string): Route {
 }
 
 
+/** The route in two words, for the board's plan column. */
+const TAG: Record<string, string> = { lend: 'USDC supply', vault: 'curated vault', yield: 'stable vault', rwa: 'T-bill token', cdp: 'stable savings', basis: 'basis vault', venue: 'stable LP', stake: 'stake pool', chain: 'bridge + use', other: 'main product' };
+
 // ---------------------------------------------------------------- screens
 
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
@@ -145,7 +149,7 @@ export function farmSteps(p: SnapshotProtocol, f: FarmInput, route: Route, tiers
   return [
     { action: `${size}. ${funding}, keeping ${usd(Math.max(1, round(f.gas_tx * 3, 2)))} of ${f.chain} gas in a fresh wallet used only for this farm.`, cost: `${usd(f.bridge)} bridge + ${usd(f.gas_tx)} per transaction`, time: '15-30 minutes' },
     { action: `On ${p.name} (${f.chain}), ${route.open}. This is the ${route.product}; its base yield of about ${route.apy}% a year is what offsets the carry of locked capital.`, cost: `${usd(round(f.gas_tx * 2, 2))} gas (approve + deposit)`, time: '10 minutes' },
-    { action: `Hold for the ${f.weeks}-week farm window: ${route.keep}. Every action comes from the same wallet so the address reads as a repeat user; points earned in the window still pay if the token ships later.`, cost: `${usd(round(f.gas_tx * acts, 2))} gas for ${acts} actions`, time: `10 minutes a month for ${f.weeks} weeks` },
+    { action: `Hold for the ${f.weeks}-week farm window: ${route.keep}. Every action comes from the same wallet so the address reads as a repeat user; points dilute against a ${usd(Math.round(KM.pool(f.tvl) / 1e5) / 10)}M farming pool (of ${usd(Math.round(f.tvl / 1e5) / 10)}M TVL) and still pay if the token ships later.`, cost: `${usd(round(f.gas_tx * acts, 2))} gas for ${acts} actions`, time: `10 minutes a month for ${f.weeks} weeks` },
     { action: `${tranche}.`, cost: "free on the protocol's own stats page", time: '5 minutes a week' },
     { action: `Two outcomes at p50. Token within 24 months (${odds(f.p24)}): a drop of ${usd(t1.ev_if[1])} on ${usd(t1.deposit)}, ${usd(t10.ev_if[1])} on ${usd(t10.deposit)}, ${usd(t50.ev_if[1])} on ${usd(t50.deposit)}, ${pct(t10.apr_if[1])} a year at ${usd(t10.deposit)}. No token (${odds(1 - f.p24)}): no drop, ${usd(t10.net_none)} at ${usd(t10.deposit)}. Blended: ${pct(t1.apr[1])} / ${pct(t10.apr[1])} / ${pct(t50.apr[1])} a year, ${t1.verdict} / ${t10.verdict} / ${t50.verdict}; break-even ${t10.breakeven === null ? 'none' : usd(t10.breakeven)}.`, cost: `carry ${usd(t10.carry)} at ${usd(t10.deposit)} (${MODEL.benchmark}% benchmark + ${route.prem}% risk premium - ${route.apy}% base APY)`, time: `${f.weeks} weeks` },
     { action: `Bookmark ${p.name}'s points or rewards page from its own docs, never from a DM or an ad, and claim only through its official claimer; a page that asks for a seed phrase is a scam.`, cost: 'nothing: a real claim never charges a deposit', time: '10 minutes when a claim opens' },
@@ -274,7 +278,7 @@ export function buildRadar(snapshot: Snapshot) {
     baskets: Object.fromEntries(MODEL.tiers.map((d) => { const { picks: _p, ...b } = KM.basket(basketRows, d); return [String(d), b]; })),
     rows: scored.map((s, i) => ({
       r: i + 1, slug: s.p.slug, name: s.p.name, seg: watch.has(s.p.slug) ? 'W' : 'E', cat: categoryOf(s.p), chains: s.p.chains,
-      tvl: s.p.tvl_usd, chg: s.p.change_7d, age: s.u.a, fdv: s.fdv, lo: s.lo, hi: s.hi, route: s.route, f: s.f,
+      tvl: s.p.tvl_usd, chg: s.p.change_7d, age: s.u.a, fdv: s.fdv, lo: s.lo, hi: s.hi, route: s.route, tag: TAG[s.route.key], f: s.f,
       b: Object.fromEntries(s.tiers.map((t) => [String(t.deposit), [t.verdict, t.apr[1]]])),
       steps: s.steps,
     })),
