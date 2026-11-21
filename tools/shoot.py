@@ -68,6 +68,18 @@ OVERLAP_JS = """() => { const out = []; let n = 0;
     for (let i = 0; i < b.length; i++) for (let j = i + 1; j < b.length; j++) { const p = b[i][1], q = b[j][1];
       if (p.left < q.right && q.left < p.right && p.top < q.bottom && q.top < p.bottom) out.push(b[i][0] + ' / ' + b[j][0]); } }
   return { n, out }; }"""
+DEEP_JS = r"""() => { const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth; };
+  const els = [...document.querySelectorAll('#top *, #tabs *, #main *, #drawer.open *')].filter((e) => !(e instanceof SVGElement) && vis(e) && e.clientWidth > 0);
+  const over = els.filter((e) => e.scrollWidth > e.clientWidth + 1 && getComputedStyle(e).overflowX !== 'auto').map((e) => e.tagName + '.' + e.className + ': ' + e.textContent.slice(0, 40));
+  const ell = els.filter((e) => getComputedStyle(e).textOverflow === 'ellipsis' || /\u2026|\.\.\.(?!\w)/.test([...e.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(''))).map((e) => e.textContent.slice(0, 50));
+  return { n: els.length, over, ell }; }"""
+SEL_JS = """() => { const c = document.createElement('canvas').getContext('2d');
+  return [...document.querySelectorAll('select')].filter((e) => e.offsetParent).map((e) => { const cs = getComputedStyle(e); c.font = cs.font;
+    const t = e.options[e.selectedIndex].text, need = Math.ceil(c.measureText(t).width) + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + 20;
+    return [t, need, e.clientWidth, need <= e.clientWidth && e.scrollWidth <= e.clientWidth]; }); }"""
+FOLD_JS = """() => { const rows = [...document.querySelectorAll('#grid tbody tr')], cut = rows.filter((tr) => { const r = tr.getBoundingClientRect(); return r.top < innerHeight && r.bottom > innerHeight; });
+  const ink = cut.flatMap((tr) => [...tr.querySelectorAll('td > *, td')].map((e) => { const g = document.createRange(); g.selectNodeContents(e); return g.getBoundingClientRect(); }).filter((b) => b.height > 0 && b.top < innerHeight));
+  return { full: rows.filter((tr) => tr.getBoundingClientRect().bottom <= innerHeight).length, ink: ink.length }; }"""
 CLIP = ".kpi b, .kpi span, .grid td b, .grid td small, .fx i, .dk b, .dk small, .dk label, h3, ol.bkl b, .bkk label, .bkk small, .stats label, .stats small, .acc small, .hb span, .strip, .led td"
 
 with sync_playwright() as pw:
@@ -95,6 +107,10 @@ with sync_playwright() as pw:
           clipped: [...document.querySelectorAll(sel)].filter(e => e.offsetParent && e.scrollWidth > e.clientWidth + 1).map(e => e.textContent.slice(0, 50)) })""", CLIP)
         check(f"{label}: no horizontal overflow", st["scroll"] <= W, st["scroll"])
         check(f"{label}: no clipped label", not st["clipped"], st["clipped"][:4])
+        deep = page.evaluate(DEEP_JS)
+        check(f"{label}: 0 of {deep['n']} visible text boxes overflow (scrollWidth <= clientWidth), 0 ellipsis", not deep["over"] and not deep["ell"], (deep["over"][:4], deep["ell"][:4]))
+        sel = page.evaluate(SEL_JS)
+        check(f"{label}: every <select> shows its whole label (text + padding + 20px arrow <= clientWidth, scrollWidth <= clientWidth)", all(f for *_, f in sel), sel)
 
     def no_overlap(label):
         r = page.evaluate(OVERLAP_JS)
@@ -107,13 +123,13 @@ with sync_playwright() as pw:
     # ---- integrity strip, computed by the page: accounting, live rows and both live refits
     strip = page.evaluate("() => document.querySelector('.strip').textContent")
     check("integrity strip: 758/758, 40/40, all rows live, value fit + ledger and launch curve re-run = shipped",
-          "758/758" in strip and "40/40" in strip and f"{N}/{N}" in strip and "4-term value fit" in strip and "758 LOO refits" in strip and "✗" not in strip, strip.strip()[:200])
+          "758/758" in strip and "40/40" in strip and f"{N}/{N}" in strip and "value fit +" in strip and "758 LOO refits" in strip and "✗" not in strip, strip.strip()[:200])
 
     # ---- every tier: the page's numbers equal board.json's for all rows
     for tier in (1000, 10000, 50000):
         page.click(f"button[data-tier='{tier}']")
         page.wait_for_timeout(120)
-        got = page.evaluate("(d) => R.rows.map(r => { const u = UN[r.slug], c = KM.campaign(O, u), t = KM.farmTier(r.f, d); return [r.slug, t.verdict, t.roi[1], KM.implied(F, u), c.p12, c.p24, c.ss, t.apr_if[1], t.apr[1]]; })", tier)
+        got = page.evaluate("(d) => R.rows.map(r => { const u = UN[r.slug], c = KM.launchCampaign(O, u), t = KM.farmTier(r.f, d); return [r.slug, t.verdict, t.roi[1], KM.impliedValue(F, u), c.p12, c.p24, c.ss, t.apr_if[1], t.apr[1]]; })", tier)
         bad = [g[0] for g in got if (lambda b: b["verdict_by_deposit"][str(tier)] != g[1] or b["net_roi_p50_pct_by_deposit"][str(tier)] != g[2] or b["implied_value_usd"] != g[3]
                or b["p_token_12m"] != g[4] or b["p_token_24m"] != g[5] or b["season_share"] != g[6] or b["net_apr_if_token_p50_pct_by_deposit"][str(tier)] != g[7] or b["net_apr_p50_pct_by_deposit"][str(tier)] != g[8])(by_slug[g[0]])]
         check(f"tier ${tier}: page recompute (FDV, P12, P24, season share, verdict, ROI, APR, if-token APR) = board.json, {len(got)} rows", not bad and len(got) == N, bad[:5])
@@ -127,8 +143,8 @@ with sync_playwright() as pw:
 
     # ---- sort, search, filters, reset
     page.click("button[data-tier='10000']")
-    for key, getter in (("apr", "T(r).apr[1]"), ("tvl", "r.tvl"), ("p", "r.f.p12")):
-        page.click(f"th[data-sort='{key}']")
+    for key, getter in (("apr", "T(r).apr[1]"), ("tvl", "r.tvl"), ("p", "r.f.p12"), ("ra", "ra(r)"), ("fdv", "r.fdv")):
+        page.click(f"[data-sort='{key}']")
         v = page.evaluate(f"() => [...document.querySelectorAll('#grid tbody tr')].map(tr => {{ const r = R.rows.find(x => x.slug === tr.dataset.slug); return {getter}; }})")
         check(f"sort: {key} descending", v == sorted(v, reverse=True) and len(v) == N)
     page.fill("#q", "lending")
@@ -154,8 +170,10 @@ with sync_playwright() as pw:
     # ---- 01 board overview at $10k, rank order
     page.evaluate("() => window.scrollTo(0, 0)")
     st = page.evaluate("() => ({rows: [...document.querySelectorAll('#grid tbody tr')].filter(tr => tr.getBoundingClientRect().bottom <= innerHeight).length, farm: [...document.querySelectorAll('.side .pill.FARM')].length, sleeves: document.querySelectorAll('.side ol.bkl').length, bottom: Math.round(document.querySelector('.side').getBoundingClientRect().bottom)})")
-    check("shot 01: 11+ ranked rows above the fold", st["rows"] >= 11, st["rows"])
+    check("shot 01: 9+ ranked rows above the fold", st["rows"] >= 9, st["rows"])
     check("shot 01: top-5 FARM setups and the allocator above the fold", st["farm"] == 5 and st["sleeves"] == 2 and st["bottom"] <= H, st)
+    fold = page.evaluate(FOLD_JS)
+    check("shot 01: 12+ complete rows, no row sliced by the bottom edge (0 glyphs of a cut row in frame)", fold["full"] >= 12 and fold["ink"] == 0, fold)
     layout("shot 01")
     no_overlap("shot 01")
     shot("01-board-overview.png")
@@ -173,7 +191,7 @@ with sync_playwright() as pw:
         steps: st.length, last: Math.round(st[st.length - 1].getBoundingClientRect().bottom), secs: d.querySelectorAll('.fe tr.sec').length,
         chart: Math.round(d.querySelector('svg.sens').getBoundingClientRect().bottom), scroll: d.scrollWidth - d.clientWidth}; }""")
     check(f"shot 02: drawer for {st['name']}", st["open"] and st["pill"] == "FARM", st["pill"])
-    check("shot 02: FDV (KM.implied) and odds (KM.campaign) both recompute = board", "✓" in st["rec"] and st["checks"] == 2, st["checks"])
+    check("shot 02: value (impliedValue) and odds (launchCampaign) both recompute = board", "✓" in st["rec"] and st["checks"] == 2, st["checks"])
     check("shot 02: token-ships / no-token / blended sections", st["secs"] == 3, st["secs"])
     check("shot 02: 7 plan steps and the sensitivity chart above the fold", st["steps"] == 7 and st["last"] <= H and st["chart"] <= H, (st["last"], st["chart"]))
     check("shot 02: drawer has no horizontal overflow", st["scroll"] <= 0, st["scroll"])
@@ -191,6 +209,8 @@ with sync_playwright() as pw:
     exp = sum(1 for r in board if r["verdict_by_deposit"]["10000"] == "FARM")
     check(f"shot 03: {exp} FARM rows only, sorted by risk-adj APR", len(st["pills"]) == exp and set(st["pills"]) == {"FARM"} and st["apr"] == sorted(st["apr"], reverse=True), len(st["pills"]))
     check("shot 03: 4-sleeve allocator and breakdown bars above the fold", st["sleeves"] == 4 and st["bars"] >= 6 and st["bottom"] <= H, st)
+    fold = page.evaluate(FOLD_JS)
+    check("shot 03: 12+ complete rows, no row sliced by the bottom edge (0 glyphs of a cut row in frame)", fold["full"] >= 12 and fold["ink"] == 0, fold)
     layout("shot 03")
     no_overlap("shot 03")
     shot("03-filtered-emerging-radar.png")

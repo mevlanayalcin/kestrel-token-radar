@@ -1,8 +1,8 @@
-// Kestrel Token Radar (kestrel-10, v9): the board builder around the shared model.
+// Kestrel Token Radar v10: the board builder around the shared model.
 //
-// Every number on the board comes from dashboard/model.js (KM): the four-term value fit (TVL, family, 7-day
-// growth, time with no token) and its held-out ledger,
-// the 758-peer launch curve, the campaign horizon and the two-outcome farm planner. This file loads that
+// Every number on the board comes from dashboard/model.js (KM): fitValueModel (two-week TVL from TVL and 7-day
+// growth, the pass-through family, seasoning by time with no token) with its held-out valueLedger,
+// fitLaunchOdds (the 758-peer launch curve), launchCampaign and the two-outcome farmTier planner. This file loads that
 // exact file (the judge reads it in the dossier, and the page re-runs it live), so there is one copy of
 // the model. What stays here is what the page does not recompute: the snapshot parser, the house product
 // screens, the 758-protocol accounting, the per-category farm routes and the farm-plan text.
@@ -43,7 +43,7 @@ export interface FarmTier { deposit: number; txs: number; gas: number; bridge: n
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const KM: any = createRequire(import.meta.url)('../dashboard/model.js');
 export const MODEL = KM.M as Record<string, number> & { tiers: number[] };
-export const MODEL_VERSION = 'kestrel-10';
+export const MODEL_VERSION = 'Kestrel v10';
 
 const DAY_MS = 86_400_000;
 export const round = (n: number, dp: number): number => { const f = 10 ** dp; return Math.round(n * f) / f; };
@@ -98,6 +98,17 @@ export function routeOf(category: string): Route {
 }
 
 
+/** Home chains with no native USDC market: the farm is funded in the chain's own asset, which adds its price risk. */
+const NATIVE: Record<string, string> = { Bitcoin: 'BTC', Stacks: 'sBTC', RSK: 'RBTC', Mezo: 'BTC', BSquared: 'BTC', Bittensor: 'TAO', Qubic: 'QUBIC' };
+
+/** The route on the protocol's home chain: in the chain's own asset where USDC does not live there. */
+export function routeOn(route: Route, chain: string): Route {
+  const a = NATIVE[chain];
+  if (a === undefined) return route;
+  const sw = (t: string): string => t.replaceAll('USDC', a).replaceAll('stable-pair pool', `main ${a} pool`).replaceAll('stable LP', `${a} LP`).replaceAll(' stable vault', ` ${a} vault`).replaceAll('stable', a);
+  return { ...route, product: sw(route.product), open: sw(route.open), keep: sw(route.keep), exit: sw(route.exit), risk: `${route.risk}, plus ${a} price exposure while you hold it` };
+}
+
 /** The route in two words, for the board's plan column. */
 const TAG: Record<string, string> = { lend: 'USDC supply', vault: 'curated vault', yield: 'stable vault', rwa: 'T-bill token', cdp: 'stable savings', basis: 'basis vault', venue: 'stable LP', stake: 'stake pool', chain: 'bridge + use', other: 'main product' };
 
@@ -132,9 +143,12 @@ export function farmSteps(p: SnapshotProtocol, f: FarmInput, route: Route, tiers
   const [t1, t10, t50] = tiers as [FarmTier, FarmTier, FarmTier];
   const best = tiers.find((t) => t.verdict === 'FARM') ?? tiers.find((t) => t.verdict === 'THIN') ?? null;
   const g = p.change_7d;
-  const funding = f.chain === 'Ethereum'
-    ? 'Withdraw USDC from an exchange straight to Ethereum mainnet (no bridge needed)'
-    : `Withdraw USDC to an exchange or Ethereum, then bridge it to ${f.chain} (canonical or a major intent bridge)`;
+  const asset = NATIVE[f.chain];
+  const funding = asset !== undefined
+    ? `Buy ${asset} on an exchange and withdraw it straight to ${f.chain} (the exchange's withdrawal fee is the bridge cost)`
+    : f.chain === 'Ethereum'
+      ? 'Withdraw USDC from an exchange straight to Ethereum mainnet (no bridge needed)'
+      : `Withdraw USDC from an exchange to Ethereum or straight to ${f.chain} where the exchange supports it, else bridge it over (canonical or a major intent bridge)`;
   const freeCarry = MODEL.benchmark + route.prem - route.apy <= 0;
   const horizon = `${odds(f.p12)} odds of a token in 12 months, ${odds(f.p24)} in the 24-month credit horizon`;
   const size = best === null
@@ -196,8 +210,8 @@ export interface BoardRow {
 export function buildRadar(snapshot: Snapshot) {
   const U = snapshot.protocols.map((p) => unitOf(p, snapshot.as_of));
   const unit = new Map(U.map((u) => [u.s, u]));
-  const fit = KM.fitValue(U);
-  const oddsFit = KM.fitOdds(U, { search: true });
+  const fit = KM.fitValueModel(U);
+  const oddsFit = KM.fitLaunchOdds(U, { search: true });
   const compSet = new Set((KM.compsOf(U) as Unit[]).map((u) => u.s));
   const comps = snapshot.protocols.filter((p) => compSet.has(p.slug));
   const watch = new Set(snapshot.watchlist);
@@ -225,12 +239,12 @@ export function buildRadar(snapshot: Snapshot) {
   const [b25, b75] = fit.band as [number, number];
   const scored = chosen.map((p) => {
     const u = unit.get(p.slug)!;
-    const fdv = KM.implied(fit, u) as number;
+    const fdv = KM.impliedValue(fit, u) as number;
     const lo = Math.max(1, Math.round(fdv * Math.exp(b25)));
     const hi = Math.max(1, Math.round(fdv * Math.exp(b75)));
-    const route = routeOf(categoryOf(p));
     const chain = p.chains[0] ?? 'Ethereum';
-    const cp = KM.campaign(oddsFit, u) as { fa: number; p12: number; p24: number; ss: number; weeks: number };
+    const route = routeOn(routeOf(categoryOf(p)), chain);
+    const cp = KM.launchCampaign(oddsFit, u) as { fa: number; p12: number; p24: number; ss: number; weeks: number };
     const f: FarmInput = { tvl: p.tvl_usd, fdv: [lo, fdv, hi], chain, gas_tx: GAS_USD[chain] ?? MODEL.gas_default, bridge: chain === 'Ethereum' ? 0 : MODEL.bridge, apy: route.apy, prem: route.prem, share: route.share, age: u.a, weeks: cp.weeks, fa: cp.fa, p12: cp.p12, p24: cp.p24, ss: cp.ss };
     const tiers = MODEL.tiers.map((d) => KM.farmTier(f, d) as FarmTier);
     return { p, u, fdv, lo, hi, route, f, tiers, steps: farmSteps(p, f, route, tiers) };

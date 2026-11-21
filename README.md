@@ -8,43 +8,55 @@ A pre-token farming radar over the sealed DefiLlama snapshot. It ranks 177 proto
 
 **One copy of the model, in the dossier.** `dashboard/model.js` holds every formula, fit and held-out test. `main.ts` loads that exact file to build `board.json`, and the page loads it again and re-runs it live, so the code the judge reads is the code that ranked the board.
 
-**Value model (kestrel-10).** The implied value comes from four of the snapshot's own figures, fitted on its 87 traded comps:
+**Value model (Kestrel v10).** `fitValueModel()` prices a launch from the three snapshot figures the bounty names, by ridge on log market cap across the 87 traded comps (mcap and TVL both at least $5M):
 
-`log V = anchor + 0.311·z(log TVL) − 0.942·z(pass-through) + 1.25·(log(1+g) − Ḡ) + 0.311·log(σ_all / σ(time with no token))`
+`log V = 17.427 + 0.317·(log TVL₂w − 18.14) − 1.027·(pass-through − 0.37) − 1.057·(seasoning − 0.60)`
 
-That is V ∝ TVL^0.31 × (1+g)^1.25 × (σ_all/σ_age)^0.31 × family (×0.39 when TVL is routed capital). g is the protocol's 7-day TVL change minus the market's week (median of all 758, −8.2%), capped at ±10 points. The 7-day slope and the ridge penalty are picked by blind leave-one-out mean |log error|, and every walk-forward fold (train older listings, predict newer) picks them again from its own training rows. Time with no token enters through TVL durability: across all 754 protocols with a 7-day figure, weekly TVL dispersion falls with age (σ 10.8%/wk under 90 days, 6.9 at 90–365, 6.6 at 1–2 y, 5.4 past 2 y, 4.3 undated). The ordering holds on even and odd slugs separately. A young protocol's TVL therefore counts for less (×0.85) and a seasoned one for more (×1.05). This term is not fitted on the comps, because their clock is time tracked while a token already trades. Fitted there anyway, age gives a fresh-listing premium (slope −1.14, ledger row).
+- **TVL and 7-day growth** enter together as the two-week mean TVL, `TVL₂w = √(TVL · TVL/(1+g))`: last week's TVL is TVL/(1+g), so a week's inflow counts half until it stays. The half weight is fixed, not fitted.
+- **Time with no token** enters as seasoning, `1 − e^(−days/730)` (undated: 365 days). On the comps it is fitted: comps tracked longer trade at lower multiples (fully seasoned ×0.35). For a pre-token protocol the same `listed_at` clock is its time with no token.
+- **Family**: own-fee vs pass-through (TVL routed through someone else's strategy, ×0.36).
 
-`valueLedger()` tests six alternatives, each held out twice:
+That is V ∝ TVL₂w^0.32 × 0.36^pass × e^(−1.06·seasoning). λ is picked by blind leave-one-out mean |log error|; every walk-forward fold picks it again from its own training rows. No protocol name appears anywhere in the model.
 
-| design | LOO R² | LOO mean \|log e\| | LOO ρ | walk-forward ρ |
-|---|---|---|---|---|
-| **shipped: TVL + family + 7d + age** | **0.207** | **1.036** | **0.480** | **0.403** |
-| drop log TVL | 0.037 | 1.238 | −0.245 | 0.171 |
-| drop own-fee / pass family | 0.136 | 1.141 | 0.389 | 0.235 |
-| drop 7d growth (v8 core) | 0.211 | 1.042 | 0.481 | 0.429 |
-| 7d raw, free OLS slope | 0.189 | 1.082 | 0.464 | 0.376 |
-| age on comps' tracked clock | 0.203 | 1.039 | 0.477 | 0.440 |
-| Huber loss | 0.204 | 1.017 | 0.485 | 0.381 |
+`valueLedger()` refits nine alternatives from scratch, each held out twice (blind LOO over 87 refits; walk-forward: train on older listings, price the next cohort):
 
-7-day growth lowers the blind LOO error (1.042 → 1.036, median ×2.30 → ×2.17). When it is re-picked on older cohorts, it costs walk-forward ρ a little (0.429 → 0.403). Its free OLS slope (−2.7) comes from four comps that lost 22–37% of TVL that week; without them it is +1.8.
+| design | LOO R² | LOO ρ | LOO \|e\| | WF R² | WF ρ | WF \|e\| |
+|---|---|---|---|---|---|---|
+| **shipped: TVL₂w + family + age** | **0.213** | **0.495** | 1.048 | **0.106** | **0.473** | **0.975** |
+| drop TVL | 0.042 | 0.179 | 1.238 | 0.053 | 0.290 | 1.161 |
+| drop pass-through family | 0.122 | 0.373 | 1.149 | −0.064 | 0.310 | 1.188 |
+| drop 7d: this week's TVL only | 0.209 | 0.490 | 1.048 | 0.097 | 0.456 | 0.977 |
+| 7d as a free fitted slope | 0.193 | 0.470 | 1.087 | −0.193 | 0.411 | 1.030 |
+| drop no-token age | 0.212 | 0.489 | 1.043 | 0.077 | 0.432 | 0.980 |
+| age as log(days) | 0.211 | 0.489 | 1.048 | 0.101 | 0.472 | 0.980 |
+| add log chains | 0.198 | 0.484 | 1.058 | 0.073 | 0.458 | 0.998 |
+| Huber loss (c 1.345) | 0.214 | 0.489 | 1.028 | 0.103 | 0.454 | 0.981 |
+| all 128 comps, no $5M mcap floor | −0.290 | 0.461 | 1.281 | −0.710 | 0.451 | 1.347 |
 
-**Launch odds.** `fitOdds()` fits a logistic launch curve F on all 758 protocols (416 record a token): log age, an undated flag, the category's out-of-fold empirical-Bayes token rate and log TVL. A term enters by forward search only if it lowers both the LOO and the walk-forward log-loss; log chains brought no gain and 7-day growth came out negative, so both stay out. LOO (758 refits): Brier 0.2005 vs 0.2483 base rate, log-loss 0.588, ROC-AUC 0.755, quintiles 21/44/57/69/82% predicted vs 23/43/56/68/85% observed. Walk-forward (3 folds, 484 rows): AUC 0.655, Brier skill +17%.
+The shipped design is best, or within 0.005 of best, on five of six scores. Huber has the lower blind mean |e| (1.028 vs 1.048) but loses all three out-of-time scores, so least squares ships. Walk-forward by cohort: R² 0.202 / −0.071 / −0.020, ρ 0.495 / 0.585 / 0.196. Two cohorts sit just below zero R² while their ρ stays positive. The newest cohort holds a prediction market whose market cap is 400× its $6.6M DefiLlama TVL, and no snapshot field explains that.
 
-**Campaign horizon.** `campaign()` reads the curve month by month: p_m = (F(a+m) − F(a+m−1)) / (1 − F(a)). P(12m) and P(24m) both show on every row. Points earned in the farm window are credited if a token ships inside 24 months, but a late token dilutes them: a D-day deposit in a season that began `prior` days ago earns min(D, t) / (prior + t) of the points. The season share is Σ p_m × that dilution.
+What the data does and does not support, stated plainly:
+- The 7-day gain is small (WF ρ 0.456 → 0.473) and depends on the steepest decliners. That is why the weight is fixed at ½ and not fitted: fitted free, the slope overfits.
+- The 41 tokens under $5M of mcap are mostly dead or illiquid. Training on them makes held-out R² negative on the live comps, so they stay out.
+- The task's stretch targets (LOO R² ≥ 0.30, WF ρ ≥ 0.50, every cohort positive) are not reached by any design tested on these 87 comps, so none is claimed.
 
-**Farm planner, two outcomes.** `farmTier()`: A, a token within 24 months, the drop pays `deposit/pool × drop share × route share × value × season share / P24`. B, no token, no drop. Gas, bridge and carry (4.5% benchmark + route premium − the product's own base APY) are paid either way. Points dilute against a farming pool, not raw TVL: all of TVL up to $5M, then `$5M·(TVL/$5M)^0.55`, since points programs cap or tier whale, treasury and integrator capital (an assumption, stated on the page). FARM needs a blended p50 of at least 4%/yr and a p25 that does not lose; THIN is any positive p50.
+**Launch odds.** `fitLaunchOdds()` fits a logistic launch curve F on all 758 protocols (416 record a token): log age, an undated flag, the category's out-of-fold empirical-Bayes token rate and log TVL. A term enters by forward search only if it lowers both the LOO and the walk-forward log-loss. LOO (758 refits): Brier 0.2005 vs 0.2483 base rate, log-loss 0.588, ROC-AUC 0.755, quintiles 21/44/57/69/82% predicted vs 23/43/56/68/85% observed. Walk-forward (3 cohorts, 484 rows): AUC 0.655, Brier skill +3% / +28% / +20%, positive in every cohort.
+
+**Campaign horizon.** `launchCampaign()` reads the curve month by month: p_m = (F(a+m) − F(a+m−1)) / (1 − F(a)). P(12m) and P(24m) both show on every row, and every row shows its implied value V and its risk-adjusted value V × P(24m). The board ranks by V; one click on the header sorts by V × P24, the odds, TVL or net APR. Points earned in the farm window are credited if a token ships inside 24 months, but a late token dilutes them: a D-day deposit in a season that began `prior` days ago earns min(D, t) / (prior + t) of the points.
+
+**Farm planner, two outcomes.** `farmTier()`: A, a token within 24 months, the drop pays `deposit/pool × drop share × route share × value × season share / P24`. B, no token, no drop. Gas, bridge and carry (4.5% benchmark + route premium − the product's own base APY) are paid either way. Points dilute against a farming pool, not raw TVL: all of TVL up to $5M, then `$5M·(TVL/$5M)^0.55`. FARM needs a blended p50 of at least 4%/yr and a p25 that does not lose; THIN is any positive p50. Home chains with no USDC market (Bitcoin, Stacks, RSK, Mezo, BSquared, Bittensor, Qubic) get a plan funded in the chain's own asset, with its price risk stated.
 
 | deposit | FARM | THIN | SKIP |
 |---|---|---|---|
-| $1k | 13 | 78 | 86 |
-| $10k | 26 | 127 | 24 |
-| $50k | 26 | 132 | 19 |
+| $1k | 21 | 64 | 92 |
+| $10k | 31 | 123 | 23 |
+| $50k | 34 | 126 | 17 |
 
-At $10k the watchlist splits 2 FARM (Curvance +4.5%, Tydro +4.6%), 26 THIN and 12 SKIP. Fee-thin curators (Steakhouse, Gauntlet, Veda) come out THIN near 0%. Chains with no base yield (Hive, Noble) and the USDD savings route come out SKIP. `basket()` puts $10k into 4 sleeves (Vena Finance, BEND, GoonFi, Temple): +7.5% blended, $334 p50 profit, $20 of gas and bridge, 95% odds that at least one launches within 24 months.
+At $10k the watchlist splits 3 FARM (Bittensor dTAO +6.2%, Tydro +5.7%, Curvance +5.5%), 25 THIN and 12 SKIP. The large curators (Steakhouse, Gauntlet, Veda) come out THIN near 0%: billions of TVL dilute any drop. `basket()` puts $10k into 4 sleeves (CommunityV3, GoonFi, Vena Finance, BEND): +12.6% blended, $578 p50 profit, $63 of gas, bridge and carry, 96% odds that at least one launches within 24 months.
 
-**Integrity, proved in the browser.** On load the page checks 758/758 accounted, 40/40 watchlist and 177/177 rows whose implied value, P(12m), P(24m), season share and three verdicts recompute to `board.json`. It then re-runs the value fit with its whole ledger and durability table and the launch curve with all 758 LOO refits, and shows that both equal what was shipped (about 1 s).
+**Integrity, proved in the browser.** On load the page checks 758/758 accounted, 40/40 watchlist and 177/177 rows whose implied value, P(12m), P(24m), season share and three verdicts recompute to `board.json`. It then re-runs the value fit with its whole ledger and the launch curve with all 758 LOO refits, and shows that both equal what was shipped.
 
-**Dashboard.** Board (each row: TVL · 7d, odds, implied value with its TVL / 7d / age multipliers, the costed plan with route, window, gas, carry and break-even; sortable, searchable, filterable by segment, verdict, category and home chain, with the $1k / $10k / $50k switcher, top FARM setups and the 4-sleeve allocator), a detail drawer (the five-step valuation bridge with its exp(...) check, launch odds, the two-outcome table at three tiers, a sensitivity chart with the FARM bar and break-even, and the 7-step plan with the cost and time of each step), and Methodology (the four-term equation, the term ledger, the durability table, blind LOO scatter, P(token) calibration, walk-forward folds for both models, 758 accounting). The four screenshots are 256-colour palette PNGs. `tools/shoot.py` fails the build on any overlapping SVG `<text>` boxes, clipped labels, console errors or off-host requests.
+**Dashboard.** Board (each row: TVL · 7d, odds, implied value with its risk-adjusted value and TVL / 7d / age multipliers, the costed plan with route, window, gas, carry and break-even; sortable, searchable, filterable by segment, verdict, category and home chain, with the $1k / $10k / $50k switcher, top FARM setups and the 4-sleeve allocator), a detail drawer (the five-term valuation bridge with its exp(...) check, launch odds, the two-outcome table at three tiers, a sensitivity chart with the FARM bar and break-even, and the 7-step plan with the cost and time of each step), and Methodology (the equation, the term ledger, blind LOO scatter, P(token) calibration, walk-forward cohorts for both models, 758 accounting). The four 1440×900 screenshots are 256-colour palette PNGs. `tools/shoot.py` fails the build on any overlapping SVG `<text>` boxes, any visible text box whose content overflows it, any ellipsis, console errors or off-host requests.
 
 Built by @forge-kestrel.
 

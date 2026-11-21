@@ -1,12 +1,12 @@
 'use strict';
-// Kestrel model (kestrel-10). main.ts builds board.json with this exact file and the page re-runs it live.
+// Kestrel model v10. main.ts builds board.json with this exact file and the page re-runs it live.
 // A unit u = {s slug, n name, c category, t TVL, g 7d %, a age days, ch chains, l listed_at, k token, m mcap}.
-//   Value: log V = anchor + e·z(log TVL) + family + bg·G(7d growth) + e·log(σ_all / σ(time with no token))
+//   Value: log V = anchor + b1·z(log two-week TVL) + b2·z(pass-through) + b3·z(seasoning), ridge on traded comps,
+//          two-week TVL = √(TVL · TVL/(1+g)) and seasoning = 1 − e^(−age/730): TVL, 7d growth and time with no token.
 //   Odds:  F(age) = logistic launch curve on all 758 protocols; P(token by t) = (F(a+t) − F(a)) / (1 − F(a)).
 //   Farm:  two outcomes over a 24-month points-credit horizon, the season share diluted by launch timing.
 const M = {
-  comp_min: 5e6, winsor: [0.05, 0.95], lams: [0.01, 0.03, 0.1, 0.3], cohorts: 4, unknown_age: 365, g_cap: 10,
-  bg: [0, 0.25, 0.5, 0.75, 1, 1.25, 1.5], age_bands: [0, 90, 365, 730],
+  comp_min: 5e6, lams: [0.01, 0.03, 0.1, 0.3], cohorts: 4, unknown_age: 365, season_days: 730,
   odds_lams: [0.001, 0.01, 0.1], odds_m: 10, age_pad: 30, credit_months: 24, month: 30.4375,
   tiers: [1000, 10000, 50000], benchmark: 4.5, prior_cap: 180, windows: [[180, 26], [365, 20], [730, 16]],
   window_old: 12, window_undated: 16, tx_base: 4, tx_per_weeks: 4, bridge: 3, gas_default: 0.3,
@@ -24,6 +24,7 @@ const PASS = new Set(['RWA', 'Onchain Capital Allocator', 'Risk Curators', 'Yiel
 const rd = (n, dp) => { const f = 10 ** dp; return Math.round(n * f) / f; };
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const by = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
 function quantile(v, q) {
   if (!v.length) return 0;
   const s = [...v].sort((a, b) => a - b), i = (s.length - 1) * q, lo = Math.floor(i), hi = Math.min(lo + 1, s.length - 1);
@@ -42,9 +43,9 @@ function spearman(a, b) {
 }
 /** Held-out skill of predicted vs actual log mcap: R², Spearman ρ, median and mean |log error|. */
 function metrics(pred, act) {
-  const mean = act.reduce((a, b) => a + b, 0) / act.length, ss = act.reduce((a, y, i) => a + (y - pred[i]) ** 2, 0), st = act.reduce((a, y) => a + (y - mean) ** 2, 0);
+  const m = mean(act), ss = act.reduce((a, y, i) => a + (y - pred[i]) ** 2, 0), st = act.reduce((a, y) => a + (y - m) ** 2, 0);
   const e = act.map((y, i) => Math.abs(y - pred[i]));
-  return { n: act.length, r2: rd(1 - ss / st, 4), rho: rd(spearman(pred, act), 4), mae: rd(quantile(e, 0.5), 4), l1: rd(e.reduce((a, b) => a + b, 0) / e.length, 4) };
+  return { n: act.length, r2: rd(1 - ss / st, 4), rho: rd(spearman(pred, act), 4), mae: rd(quantile(e, 0.5), 4), l1: rd(mean(e), 4) };
 }
 function solve(A, b) {
   const n = b.length, X = A.map((r, i) => [...r, b[i]]);
@@ -81,82 +82,82 @@ function ridge(X, y, idx, lam, huber = 0) {
   return m;
 }
 
-// ---- value model
+// ---- value model: the snapshot's TVL, 7-day growth and time with no token, priced on traded comps
 const isPass = (cat) => (PASS.has(cat) ? 1 : 0);
-/** The ridge columns: log TVL and the pass-through family. */
-const core = (u) => [rd(Math.log(u.t), 4), isPass(u.c)];
-/** 7d growth over the market week (gm = median 7d of all protocols), capped ±10 points, as log(1 + x). */
-const growth = (u, gm) => rd(Math.log(1 + clamp((u.g ?? 0) - gm, -M.g_cap, M.g_cap) / 100), 6);
+/** Half of log(1 + 7d growth): the step from the two-week mean TVL to this week's (g floored at −95%). */
+const weekStep = (u) => 0.5 * Math.log1p(Math.max(u.g ?? 0, -95) / 100);
+/** log of the two-week geometric mean TVL, √(TVL · TVL/(1+g)): a week's inflow counts half until it stays. */
+const tvl2w = (u) => Math.log(u.t) - weekStep(u);
+/** Seasoning 1 − e^(−age/730) of the time run with no token (undated: 365 days). */
+const seasoning = (u) => 1 - Math.exp(-(u.a ?? M.unknown_age) / M.season_days);
+/** The ridge columns: two-week TVL, pass-through family, seasoning. */
+const valueX = (u) => [tvl2w(u), isPass(u.c), seasoning(u)];
 /** Traded comps: a token with mcap and TVL both >= $5M, in slug order. */
-const compsOf = (U) => U.filter((u) => u.m !== null && u.m >= M.comp_min && u.t >= M.comp_min).sort((a, b) => by(a.s, b.s));
-const mktOf = (U) => rd(quantile(U.map((u) => u.g ?? 0), 0.5), 4);
-const bandOf = (a) => (a === null ? -1 : M.age_bands.filter((x) => a >= x).length - 1);
-const mad = (v) => { const m = quantile(v, 0.5); return 1.4826 * quantile(v.map((x) => Math.abs(x - m)), 0.5); };
-/** TVL durability: σ = 1.4826·MAD of all protocols' 7d moves per age band, measured again on even and odd slugs. */
-function durability(U) {
-  const G = U.filter((u) => u.g !== null).sort((a, b) => by(a.s, b.s)), sg = (rows) => rd(rows.length ? mad(rows.map((u) => u.g)) : 0, 3);
-  const half = (h) => G.filter((_, i) => i % 2 === h);
-  const bands = [-1, ...M.age_bands.keys()].map((k) => { const r = (rows) => rows.filter((u) => bandOf(u.a) === k); return { k, from: k < 0 ? null : M.age_bands[k], n: r(G).length, s: sg(r(G)), h: [sg(r(half(0))), sg(r(half(1)))] }; });
-  return { ref: sg(G), n: G.length, bands };
-}
-/** Seasoning: log(σ_all / σ_band); a young band's TVL moves more, so it counts for less. */
-const season = (D, u) => rd(Math.log(D.ref / D.bands.find((b) => b.k === bandOf(u.a)).s), 6);
+const compsOf = (U, min = M.comp_min) => U.filter((u) => u.m !== null && u.m >= min && u.t >= M.comp_min).sort((a, b) => by(a.s, b.s));
 /** Walk-forward cohorts by listed_at; undated rows train in every fold, test in none. */
 function cohorts(rows) {
   const idx = rows.map((_, i) => i), dated = idx.filter((i) => rows[i].l !== null).sort((a, b) => by(rows[a].l, rows[b].l) || a - b), C = M.cohorts;
   return { undated: idx.filter((i) => rows[i].l === null), chunks: [...Array(C).keys()].map((q) => dated.slice(Math.floor((q * dated.length) / C), Math.floor(((q + 1) * dated.length) / C))) };
 }
 
-/** One design held out twice: (bg on z, λ) picked by blind LOO mean |log error| on training rows only, so each walk-forward fold re-picks both. */
-function heldOut(comps, X, z, B, o = {}) {
-  const Y = comps.map((c) => Math.log(c.m)), lo = quantile(Y, M.winsor[0]), hi = quantile(Y, M.winsor[1]), Yw = Y.map((y) => clamp(y, lo, hi)), all = comps.map((_, i) => i);
-  const fit = (tr, lam, b) => ridge(X, Yw.map((y, i) => y - b * z[i]), tr, lam, o.huber);
-  const loo = (tr, lam, b) => tr.map((i) => { const m = fit(tr.filter((j) => j !== i), lam, b); return lin(m, X[i], m.ybar) + b * z[i]; });
-  const pick = (tr) => { let s = null; for (const b of B) for (const lam of M.lams) { const p = loo(tr, lam, b), e = metrics(p, tr.map((i) => Y[i])).l1; if (!s || e < s.e) s = { b, lam, p, e }; } return s; };
-  const best = pick(all), { undated, chunks } = cohorts(comps), folds = [], wp = [], wa = [];
+/**
+ * One design held out twice. Blind LOO: each comp priced by a fit without it. Walk-forward: train on older
+ * listings, price the next cohort. λ is picked by LOO mean |log error| on training rows only, so every fold
+ * re-picks it. o.extra: rows that train but are never scored (the sub-$5M-mcap ledger row).
+ */
+function evaluateHeldOut(comps, X, o = {}) {
+  const ex = o.extra ?? [], N = comps.length, XA = [...X, ...ex.map((r) => r.x)], Y = [...comps, ...ex].map((c) => Math.log(c.m));
+  const exTo = (d) => ex.flatMap((r, j) => (r.l === null || r.l < d ? [N + j] : []));
+  const fit = (tr, lam) => ridge(XA, Y, tr, lam, o.huber);
+  const loo = (tr, lam) => tr.filter((i) => i < N).map((i) => { const m = fit(tr.filter((j) => j !== i), lam); return lin(m, XA[i], m.ybar); });
+  const pick = (tr) => { let s = null; for (const lam of M.lams) { const p = loo(tr, lam), e = metrics(p, tr.filter((i) => i < N).map((i) => Y[i])).l1; if (!s || e < s.e) s = { lam, p, e }; } return s; };
+  const all = [...XA.keys()], best = pick(all), { undated, chunks } = cohorts(comps), folds = [], wp = [], wa = [];
   for (let f = 1; f < chunks.length; f++) {
-    const tr = [...undated, ...chunks.slice(0, f).flat()].sort((a, b) => a - b), te = chunks[f], s = pick(tr), m = fit(tr, s.lam, s.b);
-    const p = te.map((i) => lin(m, X[i], m.ybar) + s.b * z[i]), a = te.map((i) => Y[i]);
+    const te = chunks[f], tr = [...undated, ...chunks.slice(0, f).flat()].sort((a, b) => a - b), tx = [...tr, ...exTo(comps[te[0]].l)], m = fit(tx, pick(tx).lam);
+    const p = te.map((i) => lin(m, XA[i], m.ybar)), a = te.map((i) => Y[i]);
     wp.push(...p); wa.push(...a);
-    folds.push({ from: comps[te[0]].l, to: comps[te.at(-1)].l, train: tr.length, test: te.length, b: s.b, m: metrics(p, a) });
+    folds.push({ from: comps[te[0]].l, to: comps[te.at(-1)].l, train: tx.length, test: te.length, m: metrics(p, a) });
   }
-  return { ...best, Y, model: fit(all, best.lam, best.b), loo: metrics(best.p, Y), wf: { folds, pooled: metrics(wp, wa) } };
+  return { lam: best.lam, p: best.p, Y: Y.slice(0, N), model: fit(all, best.lam), loo: metrics(best.p, Y.slice(0, N)), wf: { folds, pooled: metrics(wp, wa) } };
 }
 
-/** The ledger: the shipped design against each term dropped, swapped or fitted free, every row held out twice. */
-function valueLedger(comps) {
-  const X = comps.map((c) => c.x), z = comps.map((c) => c.z), z0 = z.map(() => 0);
-  const T = (name, X1, z1, B, o) => { const h = heldOut(comps, X1, z1, B, o), k = X1[0].length - 1; return { name, b: h.b, slope: k > 1 ? rd(h.model.beta[k] / h.model.sd[k], 3) : null, r2: h.loo.r2, l1: h.loo.l1, rho: h.loo.rho, wf: h.wf.pooled.rho, wl1: h.wf.pooled.l1 }; };
-  const col = (f) => comps.map((c) => [...c.x, f(c.u)]);
+/** The ledger: the shipped design against each term dropped, swapped or added, and a robust loss; every row held out twice. */
+function valueLedger(comps, U) {
+  const X = comps.map((c) => valueX(c)), col = (f) => comps.map((c, i) => [...X[i], f(c)]), pick = (...j) => X.map((x) => j.map((k) => x[k]));
+  const thin = compsOf(U, 1).filter((u) => u.m < M.comp_min).map((u) => ({ x: valueX(u), m: u.m, l: u.l }));
+  const T = (name, X1, o) => { const h = evaluateHeldOut(comps, X1, o); return { name, r2: h.loo.r2, rho: h.loo.rho, l1: h.loo.l1, wr2: h.wf.pooled.r2, wrho: h.wf.pooled.rho, wl1: h.wf.pooled.l1 }; };
   return [
-    T('drop log TVL', comps.map((c) => [c.x[1]]), z, M.bg),
-    T('drop own-fee / pass family', comps.map((c) => [c.x[0]]), z, M.bg),
-    T('drop 7d growth (v8 core)', X, z0, [0]),
-    T('7d raw, free OLS slope', col((u) => (u.g ?? 0) / 100), z0, [0]),
-    T("age on comps' tracked clock, free", col((u) => 1 - Math.exp(-(u.a ?? M.unknown_age) / 365)), z, M.bg),
-    T('Huber loss', X, z, M.bg, { huber: 1.345 }),
+    T('drop TVL', pick(1, 2)),
+    T('drop pass-through family', pick(0, 2)),
+    T("drop 7d: this week's TVL only", comps.map((c, i) => [Math.log(c.t), X[i][1], X[i][2]])),
+    T('7d as a free fitted slope', comps.map((c, i) => [Math.log(c.t), X[i][1], X[i][2], 2 * weekStep(c)])),
+    T('drop no-token age', pick(0, 1)),
+    T('age as log(days)', comps.map((c, i) => [X[i][0], X[i][1], Math.log((c.a ?? M.unknown_age) + 30)])),
+    T('add log chains', col((c) => Math.log(Math.max(1, c.ch)))),
+    T('Huber loss (c 1.345)', X, { huber: 1.345 }),
+    T(`all ${comps.length + thin.length} comps, no $5M mcap floor`, X, { extra: thin }),
   ];
 }
 
-/** The value model on U's comps, held out twice, with its ledger and durability table. */
-function fitValue(U, o = {}) {
-  const gm = mktOf(U), comps = compsOf(U).map((u) => ({ u, s: u.s, n: u.n, c: u.c, t: u.t, m: u.m, l: u.l, x: core(u), z: growth(u, gm) }));
-  const h = heldOut(comps, comps.map((c) => c.x), comps.map((c) => c.z), M.bg), m = h.model;
-  const fit = { n: comps.length, lam: h.lam, gm, bg: h.b, gbar: rd(comps.reduce((a, c) => a + c.z, 0) / comps.length, 6), mu: m.mu.map((v) => rd(v, 6)), sd: m.sd.map((v) => rd(v, 6)), beta: m.beta.map((v) => rd(v, 6)), ybar: rd(m.ybar, 6) };
-  const resid = h.p.map((p, i) => h.Y[i] - p);
+/** The value model on U's comps: the shipped fit, held out twice, with its ledger. */
+function fitValueModel(U, o = {}) {
+  const comps = compsOf(U), h = evaluateHeldOut(comps, comps.map((c) => valueX(c))), m = h.model, r6 = (v) => rd(v, 6);
+  const fit = { n: comps.length, thin: compsOf(U, 1).length - comps.length, lam: h.lam, mu: m.mu.map(r6), sd: m.sd.map(r6), beta: m.beta.map(r6), ybar: r6(m.ybar) };
+  const slope = fit.beta.map((b, j) => rd(b / fit.sd[j], 4)), resid = h.p.map((p, i) => h.Y[i] - p);
   return {
-    ...fit, elasticity: rd(fit.beta[0] / fit.sd[0], 4), pass_mult: rd(Math.exp(fit.beta[1] / fit.sd[1]), 4), dur: durability(U),
+    ...fit, slope, elasticity: slope[0], pass_mult: rd(Math.exp(slope[1]), 4), aged_mult: rd(Math.exp(slope[2]), 4),
     loo: h.loo, wf: h.wf, band: [rd(quantile(resid, 0.25), 4), rd(quantile(resid, 0.75), 4)],
     points: comps.map((c, i) => [c.n, c.t, c.m, Math.round(Math.exp(h.p[i]))]),
-    ledger: o.ledger === false ? [] : valueLedger(comps),
+    ledger: o.ledger === false ? [] : valueLedger(comps, U),
   };
 }
-/** Log-value bridge [anchor = comps' mean log mcap, TVL, family, 7d growth, seasoning through the TVL elasticity]. */
-function bridge(F, u) {
-  return [F.ybar + F.bg * F.gbar, ...core(u).map((v, j) => F.beta[j] * ((v - F.mu[j]) / F.sd[j])), F.bg * (growth(u, F.gm) - F.gbar), F.elasticity * season(F.dur, u)];
+/** Log-value bridge [anchor, TVL, 7d growth, family, no-token seasoning]: the fit's terms, TVL's split into this week and the 7d step. */
+function valueBridge(F, u) {
+  const z = (j, v) => F.beta[j] * ((v - F.mu[j]) / F.sd[j]);
+  return [F.ybar, z(0, Math.log(u.t)), (-F.beta[0] * weekStep(u)) / F.sd[0], z(1, isPass(u.c)), z(2, seasoning(u))];
 }
 /** Implied value if a token launches: exp(Σ bridge terms), from the shipped (rounded) coefficients. */
-const implied = (F, u) => Math.max(1, Math.round(Math.exp(bridge(F, u).reduce((a, v) => a + v, 0))));
+const impliedValue = (F, u) => Math.max(1, Math.round(Math.exp(valueBridge(F, u).reduce((a, v) => a + v, 0))));
 
 // ---- launch odds: the 758-peer launch curve
 const sigmoid = (t) => 1 / (1 + Math.exp(-t));
@@ -194,7 +195,7 @@ function oddsRow(terms, u, a, undated, cat) {
 }
 
 /** Launch curve on all of U (y = token), tested by exact LOO refits and walk-forward; search adds a term only if both held-out log-losses drop. */
-function fitOdds(U0, o = {}) {
+function fitLaunchOdds(U0, o = {}) {
   const U = [...U0].sort((a, b) => by(a.s, b.s)), y = U.map((u) => u.k), cats = U.map((u) => u.c), all = U.map((_, i) => i);
   const eb = (tr) => {
     const n = {}, k = {}; let K = 0;
@@ -256,7 +257,7 @@ function windowWeeks(age) {
   return M.window_old;
 }
 /** p_m = odds of a token in month m given none yet; a D-day deposit in a season begun `prior` days ago earns min(D, t) / (prior + t). ss = Σ p_m · that. */
-function campaign(O, u) {
+function launchCampaign(O, u) {
   const a = u.a ?? M.unknown_age, cat = O.cat_logit[u.c] ?? O.prior_logit, weeks = windowWeeks(u.a), D = weeks * 7, prior = Math.min(u.a ?? M.prior_cap, M.prior_cap);
   const F = (t) => sigmoid(lin(O, oddsRow(O.terms, u, a + t, u.a === null, cat), O.b0)), f0 = F(0);
   let prev = f0, cum = 0, share = 0, p12 = 0;
@@ -297,5 +298,6 @@ function basket(rows, total) {
     apr: p.length ? rd(p.reduce((a, x) => a + x.t.apr[1], 0) / p.length, 2) : 0, any: rd(1 - p.reduce((a, x) => a * (1 - x.r.f.p24), 1), 4) };
 }
 
-const KM = { M, DROPS, PASS, rd, clamp, isPass, core, growth, season, bandOf, compsOf, fitValue, bridge, implied, pool, fitOdds, campaign, dropQ, farmTier, basket };
+const KM = { M, DROPS, PASS, rd, clamp, isPass, weekStep, tvl2w, seasoning, valueX, compsOf, evaluateHeldOut, valueLedger, fitValueModel, valueBridge, impliedValue,
+  pool, fitLaunchOdds, launchCampaign, dropQ, farmTier, basket };
 if (typeof module === 'object') module.exports = KM;
